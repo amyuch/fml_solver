@@ -9,6 +9,7 @@ class RTLParser:
     def __init__(self):
         self.driver = Driver()
         self.driver.addStandardArgs()
+        self._past_counter = 0
 
     def parse_file(self, filepath: str) -> list[TransitionSystem]:
         self.driver.parseCommandLine(f"parse {filepath}")
@@ -217,7 +218,9 @@ class RTLParser:
         if k == SyntaxKind.ConditionalStatement:
             self._process_conditional(stmt, ts)
         elif k == SyntaxKind.ExpressionStatement:
-            self._process_expr_stmt(stmt, ts)
+            result = self._assign_targets(stmt.expr, ts)
+            for target, expr in result.items():
+                ts.set_next_state(target, expr)
         elif k == SyntaxKind.SequentialBlockStatement:
             for item in stmt.items:
                 self._process_statement(item, ts)
@@ -452,6 +455,21 @@ class RTLParser:
             return self._expr_width(node.expression, ts)
         if k == SyntaxKind.UnaryBitwiseNotExpression:
             return self._expr_width(node.operand, ts)
+        if k == SyntaxKind.SimplePropertyExpr:
+            return self._expr_width(node.expr, ts) if hasattr(node, 'expr') else 1
+        if k == SyntaxKind.SimpleSequenceExpr:
+            return self._expr_width(node.expr, ts) if hasattr(node, 'expr') else 1
+        if k == SyntaxKind.InvocationExpression:
+            if hasattr(node, 'left') and hasattr(node.left, 'systemIdentifier'):
+                func_name = node.left.systemIdentifier.valueText
+                if func_name in ('$rose', '$fell', '$stable'):
+                    return 1
+                if func_name == '$past':
+                    args = self._extract_call_args(node)
+                    if args:
+                        return self._expr_width(args[0], ts)
+                    return 1
+            return 1
         return 1
 
     def _node_to_z3(self, node) -> z3.BitVecRef:
@@ -639,6 +657,25 @@ class RTLParser:
                 return result
             return operand
 
+        if k == SyntaxKind.SimplePropertyExpr:
+            if hasattr(node, 'expr'):
+                return self._node_to_z3(node.expr)
+            return z3.BitVecVal(0, 1)
+
+        if k == SyntaxKind.SimpleSequenceExpr:
+            if hasattr(node, 'expr'):
+                return self._node_to_z3(node.expr)
+            return z3.BitVecVal(0, 1)
+
+        if k == SyntaxKind.InvocationExpression:
+            if hasattr(node, 'left') and hasattr(node.left, 'systemIdentifier'):
+                func_name = node.left.systemIdentifier.valueText
+                if func_name.startswith('$'):
+                    func_name = func_name[1:]
+                args = self._extract_call_args(node)
+                return self._process_system_func(func_name, args)
+            return z3.BitVecVal(0, 1)
+
         return z3.BitVecVal(0, 1)
 
     def _z3_promote_pair(self, a, b):
@@ -655,6 +692,74 @@ class RTLParser:
     def _z3_promote(self, a, b, op):
         a, b = self._z3_promote_pair(a, b)
         return op(a, b) if z3.is_bv(a) else b
+
+    def _extract_call_args(self, node) -> list:
+        args = []
+        if hasattr(node, 'arguments') and node.arguments is not None:
+            for p in node.arguments.parameters:
+                if hasattr(p, 'expr'):
+                    args.append(p.expr)
+        return args
+
+    def _unwrap_property_wrapper(self, node):
+        while hasattr(node, 'expr') and node.kind in (SyntaxKind.SimplePropertyExpr, SyntaxKind.SimpleSequenceExpr):
+            node = node.expr
+        return node
+
+    def _process_system_func(self, func_name: str, args: list) -> z3.BitVecRef:
+        ts = self._current_ts
+
+        if func_name in ('rose', 'fell', 'stable'):
+            if not args:
+                return z3.BitVecVal(0, 1)
+            arg_node = args[0]
+            arg_expr = self._node_to_z3(arg_node)
+            arg_width = self._expr_width(arg_node, ts)
+
+            reg_name = f"__past_{func_name}_{self._past_counter}"
+            self._past_counter += 1
+            ts.add_state_var(reg_name, arg_width)
+            ts.set_next_state(reg_name, arg_expr)
+
+            past_val = ts.get_cur(reg_name)
+
+            if func_name == 'rose':
+                return z3.If(z3.And(arg_expr != 0, past_val == 0),
+                             z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
+            elif func_name == 'fell':
+                return z3.If(z3.And(arg_expr == 0, past_val != 0),
+                             z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
+            elif func_name == 'stable':
+                return z3.If(arg_expr == past_val,
+                             z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
+            return z3.BitVecVal(0, 1)
+
+        if func_name == 'past':
+            if not args:
+                return z3.BitVecVal(0, 1)
+            arg_node = args[0]
+            depth = 1
+            if len(args) >= 2:
+                depth_node = self._unwrap_property_wrapper(args[1])
+                depth_val = self._eval_literal(depth_node)
+                if depth_val is not None:
+                    depth = max(depth_val, 1)
+            arg_expr = self._node_to_z3(arg_node)
+            arg_width = self._expr_width(arg_node, ts)
+
+            # Create depth registers forming a shift chain
+            reg_names = [f"__past_{func_name}_{self._past_counter}_{i}" for i in range(depth)]
+            self._past_counter += 1
+            for i, rname in enumerate(reg_names):
+                ts.add_state_var(rname, arg_width)
+                if i == 0:
+                    ts.set_next_state(rname, arg_expr)
+                else:
+                    ts.set_next_state(rname, ts.get_cur(reg_names[i - 1]))
+
+            return ts.get_cur(reg_names[-1])
+
+        return z3.BitVecVal(0, 1)
 
     def parse_to_ts(self, filepath: str) -> TransitionSystem:
         systems = self.parse_file(filepath)

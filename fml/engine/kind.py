@@ -43,11 +43,11 @@ def check_kinduction(ts: TransitionSystem, k: int, verbose: bool = True) -> dict
 
     for pname, p_expr in props:
         state_v = [ts.state_vector(f"_{i}") for i in range(k + 2)]
-        inp_v = [ts.input_vector(f"_inp{i}") for i in range(k + 1)]
+        inp_v = [ts.input_vector(f"_inp{i}") for i in range(k + 2)]
 
         base_s = z3.Solver()
         base_s.set("timeout", 60000)
-        init_expr = _subst_state(ts, ts.init_expr, state_v, 0)
+        init_expr = _subst_state_inp(ts, ts.init_expr, state_v, inp_v, 0)
         base_s.add(z3.simplify(init_expr))
         for i in range(k):
             trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
@@ -55,7 +55,7 @@ def check_kinduction(ts: TransitionSystem, k: int, verbose: bool = True) -> dict
         _add_comb_per_state(base_s, ts, state_v, inp_v, k + 1)
         viol = []
         for i in range(k + 1):
-            viol.append(z3.simplify(z3.Not(_subst_state(ts, p_expr, state_v, i))))
+            viol.append(z3.simplify(z3.Not(_subst_state_inp(ts, p_expr, state_v, inp_v, i))))
         base_s.add(z3.Or(*viol))
 
         result = base_s.check()
@@ -70,12 +70,12 @@ def check_kinduction(ts: TransitionSystem, k: int, verbose: bool = True) -> dict
         ind_s = z3.Solver()
         ind_s.set("timeout", 60000)
         for i in range(k + 1):
-            ind_s.add(z3.simplify(_subst_state(ts, p_expr, state_v, i)))
+            ind_s.add(z3.simplify(_subst_state_inp(ts, p_expr, state_v, inp_v, i)))
         for i in range(k + 1):
             trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
             ind_s.add(z3.simplify(trans_expr))
         _add_comb_per_state(ind_s, ts, state_v, inp_v, k + 2)
-        ind_s.add(z3.simplify(z3.Not(_subst_state(ts, p_expr, state_v, k + 1))))
+        ind_s.add(z3.simplify(z3.Not(_subst_state_inp(ts, p_expr, state_v, inp_v, k + 1))))
 
         result = ind_s.check()
         if result == z3.unsat:
@@ -116,7 +116,7 @@ def check_kinduction(ts: TransitionSystem, k: int, verbose: bool = True) -> dict
         ind_s.set("timeout", 60000)
         for i in range(k + 1):
             ind_s.add(z3.simplify(_subst_trans(ts, tp_expr, state_v, inp_v, i)))
-        for i in range(k + 1):
+        for i in range(k + 2):
             trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
             ind_s.add(z3.simplify(trans_expr))
         _add_comb_per_state(ind_s, ts, state_v, inp_v, k + 3)
