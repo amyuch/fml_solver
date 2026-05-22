@@ -4,7 +4,7 @@ from .kind import check_kinduction
 
 
 class IC3:
-    def __init__(self, ts: TransitionSystem, max_frames: int = 20, max_blocking: int = 100):
+    def __init__(self, ts: TransitionSystem, max_frames: int = 20, max_blocking: int = 500):
         self.ts = ts
         self.max_frames = max_frames
         self.max_blocking = max_blocking
@@ -44,8 +44,9 @@ class IC3:
                 print(f"      counterexample at initial state")
             return {"result": "fail", "property": pname, "bound": 0}
 
-        # Add P to frame 1 (all frames ≥1 implicitly include P)
+        # frames[0] = I (init states), frames[≥1] start empty
         frames: list[list[z3.BoolRef]] = [[] for _ in range(self.max_frames + 2)]
+        frames[0].append(ts.init_expr)
 
         if verbose:
             print(f"  IC3 proving: {pname}")
@@ -61,6 +62,9 @@ class IC3:
                 return {"result": "proved", "property": pname, "k": k}
             if isinstance(blocked, dict):
                 return blocked
+
+            # Batch propagate all clauses forward after strengthening
+            self._propagate_all(k, frames, P, ts)
 
         return {"result": "unknown", "property": pname, "bound": self.max_frames}
 
@@ -138,45 +142,106 @@ class IC3:
                 if not ok:
                     return False
 
-                # Predecessor blocked. Retry at same i — the new clause
-                # in frames[0..max_i] may make cube unreachable at this level.
+                # Predecessor blocked. Retry at same i.
                 self._add_to_frames(z3.Not(pred_cube), max_i, frames, P, ts)
                 continue
             else:
-                # Cube blocked at frame i.
-                self._add_to_frames(z3.Not(cube), max_i, frames, P, ts)
+                # Cube blocked at frame i. Generalize and add clause.
+                clause = self._generalize_clause(cube, i, frames, P, ts)
+                if clause is None:
+                    clause = z3.Not(cube)
+                self._add_to_frames(clause, max_i, frames, P, ts)
                 return True
 
         return False
 
-    def _add_to_frames(self, clause, up_to, frames, P, ts):
-        """Add clause to frames 0..up_to and propagate forward."""
+    def _generalize_clause(self, cube, i, frames, P, ts):
+        if cube is None or not hasattr(cube, 'children') or len(cube.children()) == 0:
+            return z3.Not(cube)
+
+        children = list(cube.children())
+        # No generalization at frame 0 — init is a single state, so any
+        # non-init value for any variable makes the cube unreachable,
+        # causing useless clauses after sequential dropping.
+        if i <= 0:
+            return z3.Not(cube)
+
+        # Also skip generalization if there's no meaningful frame data
+        if not frames or i - 1 < 0 or not frames[i - 1]:
+            return z3.Not(cube)
+
+        meaningful = []
+        for c in children:
+            try:
+                if c.decl().name() == '=' and hasattr(c.arg(0), 'eq') and c.arg(0).eq(c.arg(1)):
+                    continue
+            except Exception:
+                pass
+            meaningful.append(c)
+
+        if not meaningful:
+            return z3.BoolVal(False)
+
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
+        cn = z3.substitute(ts.comb_expr, *cur_to_next)
+
+        to_drop = set()
+        for idx, child in enumerate(meaningful):
+            remaining = [meaningful[j] for j in range(len(meaningful)) if j != idx and id(meaningful[j]) not in to_drop]
+            if not remaining:
+                continue
+            candidate = z3.And(*remaining) if len(remaining) > 1 else remaining[0]
+
+            s = z3.Solver()
+            s.set("timeout", 200)
+            for clause in frames[i - 1]:
+                s.add(clause)
+            s.add(P)
+            s.add(ts.comb_expr)
+            s.add(ts.trans_expr)
+            s.add(cn)
+            s.add(z3.substitute(candidate, *cur_to_next))
+            if s.check() == z3.unsat:
+                to_drop.add(id(child))
+
+        final = [c for j, c in enumerate(meaningful) if id(c) not in to_drop]
+        if not final:
+            return z3.Not(cube)
+        if len(final) == 1:
+            return z3.Not(final[0])
+        return z3.Not(z3.And(*final))
+
+    def _add_to_frames(self, clause, up_to, frames, P, ts):
+        """Add clause to frames 0..up_to. Propagation handled separately."""
         for i in range(up_to + 1):
             if clause not in frames[i]:
                 frames[i].append(clause)
 
-        # Propagate to higher frames
-        for i in range(up_to + 1, len(frames) - 1):
-            s = z3.Solver()
-            s.set("timeout", 60000)
-            for c in frames[i]:
-                s.add(c)
-            if i >= 1:
-                s.add(P)
-            s.add(ts.comb_expr)
-            s.add(ts.trans_expr)
-            s.add(z3.substitute(ts.comb_expr, *cur_to_next))
-            clause_next = z3.substitute(
-                clause,
-                *[(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
-            )
-            s.add(z3.Not(clause_next))
-
-            if s.check() == z3.unsat:
-                if clause not in frames[i + 1]:
-                    frames[i + 1].append(clause)
-            else:
+    def _propagate_all(self, k, frames, P, ts):
+        """Batch propagate clauses forward after strengthening."""
+        cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
+        for _ in range(5):  # max 5 rounds
+            prog = False
+            for fi in range(min(k, len(frames) - 1)):
+                if not frames[fi]:
+                    continue
+                for clause in list(frames[fi]):
+                    if clause in frames[fi + 1]:
+                        continue
+                    s = z3.Solver()
+                    s.set("timeout", 5000)
+                    for c in frames[fi]:
+                        s.add(c)
+                    if fi >= 1:
+                        s.add(P)
+                    s.add(ts.comb_expr)
+                    s.add(ts.trans_expr)
+                    s.add(z3.substitute(ts.comb_expr, *cur_to_next))
+                    s.add(z3.substitute(z3.Not(clause), *cur_to_next))
+                    if s.check() == z3.unsat:
+                        frames[fi + 1].append(clause)
+                        prog = True
+            if not prog:
                 break
 
     def _try_convergence(self, k, frames):

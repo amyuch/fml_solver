@@ -53,7 +53,6 @@ class RTLParser:
 
     def _extract_ports(self, header, ts: TransitionSystem):
         last_direction = None
-        last_width = 1
         for port in header.ports:
             if port.kind != SyntaxKind.ImplicitAnsiPort:
                 continue
@@ -64,10 +63,8 @@ class RTLParser:
                 last_direction = direction
             else:
                 direction = last_direction or "input"
-            if width is not None and width > 0:
-                last_width = width
-            else:
-                width = last_width
+            if width is None or width <= 0:
+                width = 1
             if direction == "input":
                 ts.add_input(name, width)
             elif direction == "output":
