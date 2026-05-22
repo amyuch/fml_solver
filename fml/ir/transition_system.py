@@ -1,0 +1,150 @@
+import z3
+from typing import Optional
+
+
+class StateVar:
+    def __init__(self, name: str, width: int, init_val: int = 0):
+        self.name = name
+        self.width = width
+        self.init_val = init_val
+
+    def __repr__(self):
+        return f"StateVar({self.name}, {self.width}, init={self.init_val})"
+
+
+class TransitionSystem:
+    def __init__(self, name: str = "design"):
+        self.name = name
+        self.state_vars: dict[str, StateVar] = {}
+        self.inputs: dict[str, StateVar] = {}
+        self._cur: dict[str, z3.BitVec] = {}
+        self._next: dict[str, z3.BitVec] = {}
+        self._inps: dict[str, z3.BitVec] = {}
+        self._init_constraints: list[z3.BoolRef] = []
+        self._trans_constraints: list[z3.BoolRef] = []
+        self.properties: list[tuple[str, z3.BoolRef]] = []
+        self.trans_properties: list[tuple[str, z3.BoolRef]] = []
+        self.assumptions: list[z3.BoolRef] = []
+        self._comb_constraints: list[z3.BoolRef] = []
+        self._next_state_exprs: dict[str, z3.BitVec] = {}
+
+    def add_state_var(self, name: str, width: int, init_val: int = 0):
+        sv = StateVar(name, width, init_val)
+        self.state_vars[name] = sv
+        self._cur[name] = z3.BitVec(f"{name}", width)
+        self._next[name] = z3.BitVec(f"{name}_next", width)
+        self._init_constraints.append(
+            self._cur[name] == z3.BitVecVal(init_val, width)
+        )
+
+    def add_input(self, name: str, width: int):
+        iv = StateVar(name, width)
+        self.inputs[name] = iv
+        self._inps[name] = z3.BitVec(f"{name}_inp", width)
+
+    def set_next_state(self, name: str, expr: z3.BitVecRef):
+        self._next_state_exprs[name] = expr
+
+    def add_init(self, expr: z3.BoolRef):
+        self._init_constraints.append(expr)
+
+    def add_trans(self, expr: z3.BoolRef):
+        self._trans_constraints.append(expr)
+
+    def add_property(self, name: str, expr: z3.BoolRef):
+        self.properties.append((name, expr))
+
+    def add_trans_property(self, name: str, expr: z3.BoolRef):
+        self.trans_properties.append((name, expr))
+
+    def add_assumption(self, expr: z3.BoolRef):
+        self.assumptions.append(expr)
+
+    def add_comb_constraint(self, expr: z3.BoolRef):
+        self._comb_constraints.append(expr)
+        self._init_constraints.append(expr)
+
+    @property
+    def comb_expr(self) -> z3.BoolRef:
+        return z3.And(*self._comb_constraints) if self._comb_constraints else z3.BoolVal(True)
+
+    @property
+    def init_expr(self) -> z3.BoolRef:
+        return z3.And(*self._init_constraints) if self._init_constraints else z3.BoolVal(True)
+
+    @property
+    def trans_expr(self) -> z3.BoolRef:
+        guards = []
+        for name, expr in self._next_state_exprs.items():
+            guards.append(self._next[name] == expr)
+        guards.extend(self._trans_constraints)
+        return z3.And(*guards) if guards else z3.BoolVal(True)
+
+    def get_cur(self, name: str) -> z3.BitVecRef:
+        return self._cur[name]
+
+    def get_next(self, name: str) -> z3.BitVecRef:
+        return self._next[name]
+
+    def get_inp(self, name: str) -> z3.BitVecRef:
+        return self._inps[name]
+
+    def cur_values(self) -> list[z3.BitVecRef]:
+        return list(self._cur.values())
+
+    def next_values(self) -> list[z3.BitVecRef]:
+        return list(self._next.values())
+
+    def inp_values(self) -> list[z3.BitVecRef]:
+        return list(self._inps.values())
+
+    def all_vars(self) -> list[z3.ExprRef]:
+        return self.cur_values() + self.inp_values() + self.next_values()
+
+    def substitute_cur_with_next(self, expr: z3.BoolRef) -> z3.BoolRef:
+        sub_map = {}
+        for name in self.state_vars:
+            sub_map[self._cur[name]] = self._next[name]
+        return z3.substitute(expr, *[(v, k) for k, v in sub_map.items()])
+
+    def substitute_next_with_cur(self, expr: z3.ExprRef) -> z3.ExprRef:
+        sub_map = {}
+        for name in self.state_vars:
+            sub_map[self._next[name]] = self._cur[name]
+        return z3.substitute(expr, *[(v, k) for k, v in sub_map.items()])
+
+    def rename_cur_to(self, expr: z3.BoolRef, suffix: str) -> z3.BoolRef:
+        sub_map = {}
+        for name in self.state_vars:
+            fresh = z3.BitVec(f"{name}{suffix}", self.state_vars[name].width)
+            sub_map[self._cur[name]] = fresh
+        return z3.substitute(expr, *[(k, v) for k, v in sub_map.items()])
+
+    def state_vector(self, suffix: str = "") -> dict[str, z3.BitVecRef]:
+        if suffix:
+            return {name: z3.BitVec(f"{name}{suffix}", sv.width)
+                    for name, sv in self.state_vars.items()}
+        return dict(self._cur)
+
+    def input_vector(self, suffix: str = "") -> dict[str, z3.BitVecRef]:
+        if suffix:
+            return {name: z3.BitVec(f"{name}{suffix}", iv.width)
+                    for name, iv in self.inputs.items()}
+        return dict(self._inps)
+
+    def summarize(self) -> str:
+        lines = [f"=== Transition System: {self.name} ==="]
+        lines.append(f"State vars ({len(self.state_vars)}):")
+        for sv in self.state_vars.values():
+            lines.append(f"  {sv}")
+        lines.append(f"Inputs ({len(self.inputs)}):")
+        for iv in self.inputs.values():
+            lines.append(f"  {iv}")
+        lines.append(f"Properties ({len(self.properties)}):")
+        for n, _ in self.properties:
+            lines.append(f"  {n}")
+        lines.append(f"Init constraints: {len(self._init_constraints)}")
+        lines.append(f"Trans constraints: {len(self._trans_constraints)}")
+        lines.append(f"Comb constraints: {len(self._comb_constraints)}")
+        lines.append(f"Next-state assignments: {len(self._next_state_exprs)}")
+        return "\n".join(lines)
