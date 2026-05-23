@@ -229,11 +229,51 @@ class RTLParser:
             for item in stmt.items:
                 self._process_statement(item, ts)
         elif k == SyntaxKind.CaseStatement:
-            pass
+            self._process_case(stmt, ts)
 
     def _process_conditional(self, stmt, ts: TransitionSystem):
         self._current_ts = ts
         result = self._stmt_next_conditional(stmt, ts)
+        for target, expr in result.items():
+            ts.set_next_state(target, expr)
+
+    def _extract_clause_assignments(self, stmt, ts: TransitionSystem) -> dict:
+        k = stmt.kind
+        if k == SyntaxKind.ExpressionStatement:
+            return self._assign_targets(stmt.expr, ts)
+        elif k == SyntaxKind.SequentialBlockStatement:
+            result = {}
+            for item in stmt.items:
+                result.update(self._extract_clause_assignments(item, ts))
+            return result
+        elif k == SyntaxKind.ConditionalStatement:
+            return self._stmt_next_conditional(stmt, ts)
+        return {}
+
+    def _stmt_next_case(self, stmt, ts: TransitionSystem) -> dict:
+        case_expr = self._node_to_z3(stmt.expr)
+        items = list(stmt.items)
+        result = {}
+        for item in reversed(items):
+            if item.kind == SyntaxKind.DefaultCaseItem:
+                result = self._extract_clause_assignments(item.clause, ts)
+            elif item.kind == SyntaxKind.StandardCaseItem:
+                match_vals = [self._node_to_z3(e) for e in item.expressions]
+                clause_dict = self._extract_clause_assignments(item.clause, ts)
+                cond = z3.Or(*[case_expr == mv for mv in match_vals]) if len(match_vals) > 1 else (case_expr == match_vals[0])
+                new_result = {}
+                all_targets = set(result.keys()) | set(clause_dict.keys())
+                for t in all_targets:
+                    if t in clause_dict:
+                        prev = result.get(t, ts.get_next(t))
+                        new_result[t] = z3.If(cond, clause_dict[t], prev)
+                    else:
+                        new_result[t] = result.get(t, ts.get_next(t))
+                result = new_result
+        return result
+
+    def _process_case(self, stmt, ts: TransitionSystem):
+        result = self._stmt_next_case(stmt, ts)
         for target, expr in result.items():
             ts.set_next_state(target, expr)
 
@@ -281,6 +321,8 @@ class RTLParser:
             return result
         if k == SyntaxKind.ConditionalStatement:
             return self._stmt_next_conditional(stmt, ts)
+        if k == SyntaxKind.CaseStatement:
+            return self._stmt_next_case(stmt, ts)
         return {}
 
     def _assign_targets(self, expr, ts: TransitionSystem) -> dict:

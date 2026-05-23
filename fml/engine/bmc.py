@@ -83,6 +83,21 @@ def bmc_incremental(ts: TransitionSystem, max_k: int, verbose: bool = True) -> d
             else:
                 lo = mid + 1
 
+    for tpname, tp_expr in ts.trans_properties:
+        if verbose:
+            print(f"  BMC binary search [0, {max_k}] for {tpname}...")
+        lo, hi = 1, max_k
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if verbose:
+                print(f"    depth: {mid}...")
+            r = _bmc_check_one(ts, tpname, tp_expr, mid, is_trans=True)
+            if r is not None:
+                best_result = r
+                hi = mid - 1
+            else:
+                lo = mid + 1
+
     if best_result is not None:
         if verbose:
             print(f"  Minimum CEX depth: {best_result['bound']} ({best_result['property']})")
