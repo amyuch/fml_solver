@@ -1,4 +1,5 @@
 import z3
+import warnings
 from pyslang.driver import Driver
 from pyslang.syntax import SyntaxKind
 from pyslang.parsing import TokenKind
@@ -47,9 +48,30 @@ class RTLParser:
         header = mod_node.header
         mod_name = self._token_text(header.name)
         ts = TransitionSystem(mod_name)
+        self._extract_header_params(header, ts)
         self._extract_ports(header, ts)
         self._extract_body(mod_node, ts)
         return ts
+
+    def _extract_header_params(self, header, ts: TransitionSystem):
+        if hasattr(header, 'parameters') and header.parameters is not None:
+            for p in header.parameters:
+                if hasattr(p, 'kind') and p.kind == SyntaxKind.ParameterDeclaration:
+                    self._process_param_decl(p, ts)
+
+    def _process_param_decl(self, node, ts: TransitionSystem, width_override: int = None):
+        w = width_override
+        if w is None and hasattr(node, 'type') and node.type is not None:
+            w = self._extract_width_from_node(node.type)
+        if w is None or w <= 0:
+            w = 1
+        for decl in node.declarators:
+            name = self._token_text(decl.name)
+            init_val = None
+            if hasattr(decl, 'initializer') and decl.initializer is not None:
+                init_val = self._eval_literal_expr(decl.initializer.expr, ts)
+            if name not in ts.params:
+                ts.add_param(name, w, init_val)
 
     def _extract_ports(self, header, ts: TransitionSystem):
         last_direction = None
@@ -155,6 +177,247 @@ class RTLParser:
                 self._process_assertion(member, ts)
             elif k == SyntaxKind.DataDeclaration:
                 self._process_data_declaration(member, ts)
+            elif k == SyntaxKind.GenerateRegion:
+                self._process_generate_region(member, ts)
+            elif k == SyntaxKind.GenvarDeclaration:
+                pass
+            elif k == SyntaxKind.ParameterDeclarationStatement:
+                self._process_parameter_declaration(member, ts)
+            else:
+                warnings.warn(f"Unhandled module member: {k}", stacklevel=2)
+
+    def _process_parameter_declaration(self, node, ts: TransitionSystem):
+        if hasattr(node, 'parameter') and node.parameter is not None:
+            self._process_param_decl(node.parameter, ts)
+
+    def _process_generate_region(self, node, ts: TransitionSystem):
+        for member in node.members:
+            k = member.kind
+            if k == SyntaxKind.IfGenerate:
+                self._process_if_generate(member, ts)
+            elif k == SyntaxKind.LoopGenerate:
+                self._process_loop_generate(member, ts)
+            elif k == SyntaxKind.CaseGenerate:
+                self._process_case_generate(member, ts)
+            elif k == SyntaxKind.GenerateBlock:
+                self._process_generate_body(member, ts)
+            else:
+                warnings.warn(f"Unhandled generate region member: {k}", stacklevel=2)
+
+    def _process_if_generate(self, node, ts: TransitionSystem):
+        cond_val = self._eval_literal_expr(node.condition, ts)
+        taken = cond_val is not None and cond_val != 0
+        if cond_val is not None and not taken:
+            if node.elseClause is not None and node.elseClause.clause is not None:
+                self._process_generate_item_body(node.elseClause.clause, ts)
+        else:
+            self._process_generate_item_body(node.block, ts)
+            if cond_val is None:
+                if node.elseClause is not None and node.elseClause.clause is not None:
+                    self._process_generate_item_body(node.elseClause.clause, ts)
+
+    def _process_loop_generate(self, node, ts: TransitionSystem):
+        genvar_name = self._token_text(node.identifier)
+        init_expr = node.initialExpr
+        stop_expr = node.stopExpr
+        it_expr = node.iterationExpr
+
+        init_val = self._eval_literal_expr(init_expr, ts)
+        if init_val is None:
+            return
+
+        bound_val = self._eval_stop_bound(stop_expr, ts)
+        if bound_val is None:
+            return
+
+        step = 1
+        if it_expr.kind == SyntaxKind.PostincrementExpression:
+            step = 1
+        elif it_expr.kind == SyntaxKind.PreincrementExpression:
+            step = 1
+        elif it_expr.kind == SyntaxKind.PostdecrementExpression:
+            step = -1
+        elif it_expr.kind == SyntaxKind.PredecrementExpression:
+            step = -1
+        elif it_expr.kind == SyntaxKind.AssignmentExpression:
+            step_val = self._eval_literal_expr(it_expr.rhs, ts)
+            if step_val is not None:
+                step = step_val
+
+        for i in range(init_val, bound_val, step):
+            self._process_generate_body(node.block, ts, genvar_subst={genvar_name: i})
+
+    def _eval_stop_bound(self, node, ts) -> int | None:
+        k = node.kind
+        if k == SyntaxKind.LessThanExpression or k == SyntaxKind.LessThanEqualExpression:
+            right = self._eval_literal_expr(node.right, ts)
+            if right is not None:
+                if k == SyntaxKind.LessThanEqualExpression:
+                    return right + 1
+                return right
+        if k == SyntaxKind.GreaterThanExpression or k == SyntaxKind.GreaterThanEqualExpression:
+            right = self._eval_literal_expr(node.right, ts)
+            if right is not None:
+                if k == SyntaxKind.GreaterThanEqualExpression:
+                    return right - 1
+                return right
+        return None
+
+    def _process_case_generate(self, node, ts: TransitionSystem):
+        cond_val = self._eval_literal_expr(node.condition, ts)
+        if cond_val is None:
+            return
+
+        matched = False
+        for item in node.items:
+            if item.kind == SyntaxKind.StandardCaseItem:
+                for expr in item.expressions:
+                    ev = self._eval_literal_expr(expr, ts)
+                    if ev is not None and ev == cond_val:
+                        self._process_generate_item_body(item.clause, ts)
+                        matched = True
+                        break
+            elif item.kind == SyntaxKind.DefaultCaseItem:
+                if not matched:
+                    self._process_generate_item_body(item.clause, ts)
+
+    def _process_generate_body(self, node, ts: TransitionSystem, genvar_subst=None):
+        if node.kind == SyntaxKind.GenerateBlock:
+            for m in node.members:
+                self._dispatch_generate_member(m, ts, genvar_subst)
+        else:
+            self._dispatch_generate_member(node, ts, genvar_subst)
+
+    def _process_generate_item_body(self, node, ts: TransitionSystem, genvar_subst=None):
+        if node.kind == SyntaxKind.GenerateBlock:
+            for m in node.members:
+                self._dispatch_generate_member(m, ts, genvar_subst)
+        else:
+            self._dispatch_generate_member(node, ts, genvar_subst)
+
+    def _dispatch_generate_member(self, node, ts: TransitionSystem, genvar_subst=None):
+        if genvar_subst:
+            self._genvar_subst = genvar_subst
+        k = node.kind
+        if k == SyntaxKind.AlwaysFFBlock:
+            self._process_always_ff(node, ts)
+        elif k == SyntaxKind.AlwaysCombBlock:
+            self._process_always_comb(node, ts)
+        elif k == SyntaxKind.AlwaysLatchBlock:
+            self._process_always_comb(node, ts)
+        elif k == SyntaxKind.AlwaysBlock:
+            self._process_always_comb(node, ts)
+        elif k == SyntaxKind.ContinuousAssign:
+            self._process_cont_assign(node, ts)
+        elif k == SyntaxKind.ConcurrentAssertionMember:
+            self._process_assertion(node, ts)
+        elif k == SyntaxKind.DataDeclaration:
+            self._process_data_declaration(node, ts)
+        elif k == SyntaxKind.GenerateRegion:
+            self._process_generate_region(node, ts)
+        elif k == SyntaxKind.IfGenerate:
+            self._process_if_generate(node, ts)
+        elif k == SyntaxKind.LoopGenerate:
+            self._process_loop_generate(node, ts)
+        elif k == SyntaxKind.CaseGenerate:
+            self._process_case_generate(node, ts)
+        elif k == SyntaxKind.GenvarDeclaration:
+            pass
+        elif k == SyntaxKind.ParameterDeclarationStatement:
+            self._process_parameter_declaration(node, ts)
+        else:
+            warnings.warn(f"Unhandled generate member: {k}", stacklevel=2)
+        if genvar_subst:
+            self._genvar_subst = None
+
+    def _eval_literal_expr(self, node, ts: TransitionSystem = None) -> int | None:
+        if node is None:
+            return None
+        k = node.kind
+
+        if k == SyntaxKind.IntegerLiteralExpression:
+            return self._eval_literal(node.literal)
+        if k == SyntaxKind.IntegerVectorExpression:
+            val = self._eval_literal(node.value) if hasattr(node, 'value') else None
+            return val
+
+        if k == SyntaxKind.IdentifierName:
+            name = self._token_text(node.identifier)
+            if getattr(self, '_genvar_subst', None) and name in self._genvar_subst:
+                return self._genvar_subst[name]
+            if ts is not None and name in ts.params:
+                return ts.params[name][1]
+            return None
+
+        if k == SyntaxKind.ParenthesizedExpression:
+            return self._eval_literal_expr(node.expression, ts)
+
+        has_operand = hasattr(node, 'operand') and node.operand is not None
+        has_left = hasattr(node, 'left') and node.left is not None
+        has_right = hasattr(node, 'right') and node.right is not None
+
+        if has_operand and not has_left and not has_right:
+            inner = self._eval_literal_expr(node.operand, ts)
+            if inner is None:
+                return None
+            if k == SyntaxKind.UnaryMinusExpression:
+                return -inner
+            if k == SyntaxKind.UnaryPlusExpression:
+                return inner
+            if k == SyntaxKind.UnaryBitwiseNotExpression:
+                return ~inner
+            if k == SyntaxKind.UnaryLogicalNotExpression:
+                return 0 if inner else 1
+            return None
+
+        if has_left and has_right:
+            left = self._eval_literal_expr(node.left, ts)
+            right = self._eval_literal_expr(node.right, ts)
+            if left is None or right is None:
+                return None
+            if k == SyntaxKind.AddExpression:
+                return left + right
+            if k == SyntaxKind.SubtractExpression:
+                return left - right
+            if k == SyntaxKind.MultiplyExpression:
+                return left * right
+            if k == SyntaxKind.DivideExpression:
+                return left // right if right != 0 else None
+            if k == SyntaxKind.ModExpression:
+                return left % right if right != 0 else None
+            if k == SyntaxKind.EqualityExpression:
+                return 1 if left == right else 0
+            if k == SyntaxKind.InequalityExpression:
+                return 1 if left != right else 0
+            if k == SyntaxKind.LessThanExpression:
+                return 1 if left < right else 0
+            if k == SyntaxKind.GreaterThanExpression:
+                return 1 if left > right else 0
+            if k == SyntaxKind.LessThanEqualExpression:
+                return 1 if left <= right else 0
+            if k == SyntaxKind.GreaterThanEqualExpression:
+                return 1 if left >= right else 0
+            if k == SyntaxKind.BinaryAndExpression:
+                return left & right
+            if k == SyntaxKind.BinaryOrExpression:
+                return left | right
+            if k == SyntaxKind.BinaryXorExpression:
+                return left ^ right
+            if k == SyntaxKind.LogicalAndExpression:
+                return 1 if (left and right) else 0
+            if k == SyntaxKind.LogicalOrExpression:
+                return 1 if (left or right) else 0
+            if k == SyntaxKind.LogicalShiftRightExpression:
+                return left >> right
+            if k == SyntaxKind.LogicalShiftLeftExpression:
+                return left << right
+            if k == SyntaxKind.ArithmeticShiftRightExpression:
+                return left >> right
+            if k == SyntaxKind.ArithmeticShiftLeftExpression:
+                return left << right
+            return None
+
+        return None
 
     def _process_data_declaration(self, node, ts: TransitionSystem):
         w = self._extract_width_from_node(node.type)
@@ -230,6 +493,8 @@ class RTLParser:
                 self._process_statement(item, ts)
         elif k == SyntaxKind.CaseStatement:
             self._process_case(stmt, ts)
+        else:
+            warnings.warn(f"Unhandled statement: {k}", stacklevel=2)
 
     def _process_conditional(self, stmt, ts: TransitionSystem):
         self._current_ts = ts
@@ -248,6 +513,8 @@ class RTLParser:
             return result
         elif k == SyntaxKind.ConditionalStatement:
             return self._stmt_next_conditional(stmt, ts)
+        else:
+            warnings.warn(f"Unhandled clause assignment: {k}", stacklevel=2)
         return {}
 
     def _stmt_next_case(self, stmt, ts: TransitionSystem) -> dict:
@@ -805,6 +1072,7 @@ class RTLParser:
                 return self._process_system_func(func_name, args)
             return z3.BitVecVal(0, 1)
 
+        warnings.warn(f"Unhandled expression node: {k}", stacklevel=2)
         return z3.BitVecVal(0, 1)
 
     def _z3_promote_pair(self, a, b):

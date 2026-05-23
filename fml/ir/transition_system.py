@@ -17,6 +17,7 @@ class TransitionSystem:
         self.name = name
         self.state_vars: dict[str, StateVar] = {}
         self.inputs: dict[str, StateVar] = {}
+        self.params: dict[str, tuple[int, int | None]] = {}
         self._cur: dict[str, z3.BitVec] = {}
         self._next: dict[str, z3.BitVec] = {}
         self._inps: dict[str, z3.BitVec] = {}
@@ -63,6 +64,9 @@ class TransitionSystem:
 
     def add_assumption(self, expr: z3.BoolRef):
         self.assumptions.append(expr)
+
+    def add_param(self, name: str, width: int, init_val: int | None = None):
+        self.params[name] = (width, init_val)
 
     @property
     def assumption_expr(self) -> z3.BoolRef:
