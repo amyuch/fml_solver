@@ -42,116 +42,127 @@ def _add_acts_per_state(solver, ts, states, inp, count):
 
 
 def check_kinduction(ts: TransitionSystem, k: int, verbose: bool = True) -> dict:
-    props = ts.properties
-    trans_props = ts.trans_properties
-
-    if not props and not trans_props:
+    max_k = k
+    if not ts.properties and not ts.trans_properties:
         return {"result": "unknown", "reason": "no properties"}
 
     failures = []
-    proved_count = 0
-    total_count = 0
+    unproved = set()
+    for pname, _ in ts.properties:
+        unproved.add(("state", pname))
+    for tpname, _ in ts.trans_properties:
+        unproved.add(("trans", tpname))
 
-    for pname, p_expr in props:
-        total_count += 1
-        state_v = [ts.state_vector(f"_{i}") for i in range(k + 2)]
-        inp_v = [ts.input_vector(f"_inp{i}") for i in range(k + 2)]
+    for kk in range(1, max_k + 1):
+        if not unproved:
+            break
 
-        base_s = z3.Solver()
-        base_s.set("timeout", 60000)
-        init_expr = _subst_state_inp(ts, ts.init_expr, state_v, inp_v, 0)
-        base_s.add(z3.simplify(init_expr))
-        _add_acts_per_state(base_s, ts, state_v, inp_v, k + 1)
-        for i in range(k):
-            trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
-            base_s.add(z3.simplify(trans_expr))
-        _add_comb_per_state(base_s, ts, state_v, inp_v, k + 1)
-        viol = []
-        for i in range(k + 1):
-            viol.append(z3.simplify(z3.Not(_subst_state_inp(ts, p_expr, state_v, inp_v, i))))
-        base_s.add(z3.Or(*viol))
+        to_remove = []
+        for ptype, pname in list(unproved):
+            if ptype == "state":
+                p_expr = dict(ts.properties).get(pname)
+                if p_expr is None:
+                    to_remove.append((ptype, pname))
+                    continue
 
-        result = base_s.check()
-        if result == z3.sat:
-            failures.append({
-                "result": "fail",
-                "property": pname,
-                "stage": "base",
-                "bound": k,
-            })
-            continue
+                state_v = [ts.state_vector(f"_{i}") for i in range(kk + 2)]
+                inp_v = [ts.input_vector(f"_inp{i}") for i in range(kk + 2)]
 
-        ind_s = z3.Solver()
-        ind_s.set("timeout", 60000)
-        for i in range(k + 1):
-            ind_s.add(z3.simplify(_subst_state_inp(ts, p_expr, state_v, inp_v, i)))
-        _add_acts_per_state(ind_s, ts, state_v, inp_v, k + 2)
-        for i in range(k + 1):
-            trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
-            ind_s.add(z3.simplify(trans_expr))
-        _add_comb_per_state(ind_s, ts, state_v, inp_v, k + 2)
-        ind_s.add(z3.simplify(z3.Not(_subst_state_inp(ts, p_expr, state_v, inp_v, k + 1))))
+                base_s = z3.Solver()
+                base_s.set("timeout", ts.timeout)
+                init_expr = _subst_state_inp(ts, ts.init_expr, state_v, inp_v, 0)
+                base_s.add(z3.simplify(init_expr))
+                _add_acts_per_state(base_s, ts, state_v, inp_v, kk + 1)
+                for i in range(kk):
+                    trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
+                    base_s.add(z3.simplify(trans_expr))
+                _add_comb_per_state(base_s, ts, state_v, inp_v, kk + 1)
+                viol = []
+                for i in range(kk + 1):
+                    viol.append(z3.simplify(z3.Not(_subst_state_inp(ts, p_expr, state_v, inp_v, i))))
+                base_s.add(z3.Or(*viol))
 
-        result = ind_s.check()
-        if result == z3.unsat:
-            if verbose:
-                print(f"  k-induction proved {pname} with k={k}")
-            proved_count += 1
+                result = base_s.check()
+                if result == z3.sat:
+                    failures.append({
+                        "result": "fail", "property": pname, "stage": "base", "bound": kk,
+                    })
+                    to_remove.append((ptype, pname))
+                    continue
 
-    for tpname, tp_expr in trans_props:
-        total_count += 1
-        if k < 1:
-            continue
+                ind_s = z3.Solver()
+                ind_s.set("timeout", ts.timeout)
+                for i in range(kk + 1):
+                    ind_s.add(z3.simplify(_subst_state_inp(ts, p_expr, state_v, inp_v, i)))
+                _add_acts_per_state(ind_s, ts, state_v, inp_v, kk + 2)
+                for i in range(kk + 1):
+                    trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
+                    ind_s.add(z3.simplify(trans_expr))
+                _add_comb_per_state(ind_s, ts, state_v, inp_v, kk + 2)
+                ind_s.add(z3.simplify(z3.Not(_subst_state_inp(ts, p_expr, state_v, inp_v, kk + 1))))
 
-        state_v = [ts.state_vector(f"_{i}") for i in range(k + 3)]
-        inp_v = [ts.input_vector(f"_inp{i}") for i in range(k + 2)]
+                ind_result = ind_s.check()
+                if ind_result == z3.unsat:
+                    if verbose:
+                        print(f"  k-induction proved {pname} with k={kk}")
+                    to_remove.append((ptype, pname))
 
-        base_s = z3.Solver()
-        base_s.set("timeout", 60000)
-        init_expr = _subst_state(ts, ts.init_expr, state_v, 0)
-        base_s.add(z3.simplify(init_expr))
-        _add_acts_per_state(base_s, ts, state_v, inp_v, k + 2)
-        for i in range(k):
-            trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
-            base_s.add(z3.simplify(trans_expr))
-        _add_comb_per_state(base_s, ts, state_v, inp_v, k + 1)
-        viol = []
-        for i in range(k):
-            viol.append(z3.simplify(z3.Not(_subst_trans(ts, tp_expr, state_v, inp_v, i))))
-        base_s.add(z3.Or(*viol))
+            elif ptype == "trans":
+                tp_expr = dict(ts.trans_properties).get(pname)
+                if tp_expr is None:
+                    to_remove.append((ptype, pname))
+                    continue
 
-        result = base_s.check()
-        if result == z3.sat:
-            failures.append({
-                "result": "fail",
-                "property": tpname,
-                "stage": "base",
-                "bound": k,
-            })
-            continue
+                state_v = [ts.state_vector(f"_{i}") for i in range(kk + 3)]
+                inp_v = [ts.input_vector(f"_inp{i}") for i in range(kk + 2)]
 
-        ind_s = z3.Solver()
-        ind_s.set("timeout", 60000)
-        for i in range(k + 1):
-            ind_s.add(z3.simplify(_subst_trans(ts, tp_expr, state_v, inp_v, i)))
-        _add_acts_per_state(ind_s, ts, state_v, inp_v, k + 3)
-        for i in range(k + 2):
-            trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
-            ind_s.add(z3.simplify(trans_expr))
-        _add_comb_per_state(ind_s, ts, state_v, inp_v, k + 3)
-        ind_s.add(z3.simplify(z3.Not(_subst_trans(ts, tp_expr, state_v, inp_v, k + 1))))
+                base_s = z3.Solver()
+                base_s.set("timeout", ts.timeout)
+                init_expr = _subst_state(ts, ts.init_expr, state_v, 0)
+                base_s.add(z3.simplify(init_expr))
+                _add_acts_per_state(base_s, ts, state_v, inp_v, kk + 2)
+                for i in range(kk):
+                    trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
+                    base_s.add(z3.simplify(trans_expr))
+                _add_comb_per_state(base_s, ts, state_v, inp_v, kk + 1)
+                viol = []
+                for i in range(kk):
+                    viol.append(z3.simplify(z3.Not(_subst_trans(ts, tp_expr, state_v, inp_v, i))))
+                base_s.add(z3.Or(*viol))
 
-        result = ind_s.check()
-        if result == z3.unsat:
-            if verbose:
-                print(f"  k-induction proved {tpname} with k={k}")
-            proved_count += 1
+                result = base_s.check()
+                if result == z3.sat:
+                    failures.append({
+                        "result": "fail", "property": pname, "stage": "base", "bound": kk,
+                    })
+                    to_remove.append((ptype, pname))
+                    continue
+
+                ind_s = z3.Solver()
+                ind_s.set("timeout", ts.timeout)
+                for i in range(kk + 1):
+                    ind_s.add(z3.simplify(_subst_trans(ts, tp_expr, state_v, inp_v, i)))
+                _add_acts_per_state(ind_s, ts, state_v, inp_v, kk + 3)
+                for i in range(kk + 2):
+                    trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
+                    ind_s.add(z3.simplify(trans_expr))
+                _add_comb_per_state(ind_s, ts, state_v, inp_v, kk + 3)
+                ind_s.add(z3.simplify(z3.Not(_subst_trans(ts, tp_expr, state_v, inp_v, kk + 1))))
+
+                ind_result = ind_s.check()
+                if ind_result == z3.unsat:
+                    if verbose:
+                        print(f"  k-induction proved {pname} with k={kk}")
+                    to_remove.append((ptype, pname))
+
+        for item in to_remove:
+            unproved.discard(item)
 
     if failures:
         first = failures[0]
         first["failures"] = failures
         return first
 
-    if total_count > 0 and proved_count == total_count:
-        return {"result": "proved", "bound": k}
-    return {"result": "unknown", "bound": k}
+    if not unproved:
+        return {"result": "proved", "bound": max_k}
+    return {"result": "unknown", "bound": max_k}

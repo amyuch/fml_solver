@@ -250,24 +250,14 @@ def _parse_all_modules(filepath):
     return modules
 
 
-def _flatten_from(top_data, mod_name, search_dirs, visited_files, module_cache):
-    """Recursively flatten starting from a module.
+def _flatten_from(top_data, mod_name, search_dirs, visited_files, module_cache, _processing=None):
+    if _processing is None:
+        _processing = set()
 
-    top_data: (ts, ast_node, parser) for the current module.
-    module_cache: global dict of module_name -> (ts, ast_node, parser).
-    Returns the flattened TransitionSystem.
-    """
-    ts, mod_node, _parser = top_data
+    if mod_name in _processing:
+        return ts
 
-    # Already processed this module (flattening may be in progress or done)
-    # Use a separate 'processing' set to detect cycles
-    if hasattr(_flatten_from, '_processing'):
-        if mod_name in _flatten_from._processing:
-            return ts
-    else:
-        _flatten_from._processing = set()
-
-    _flatten_from._processing.add(mod_name)
+    _processing.add(mod_name)
 
     # Find instances in this module
     instances = _collect_instances(mod_node, _parser)
@@ -286,13 +276,13 @@ def _flatten_from(top_data, mod_name, search_dirs, visited_files, module_cache):
             continue
 
         sub_data = module_cache[sub_type]
-        sub_ts = _flatten_from(sub_data, sub_type, search_dirs, visited_files, module_cache)
+        sub_ts = _flatten_from(sub_data, sub_type, search_dirs, visited_files, module_cache, _processing)
         if sub_ts is None:
             continue
 
         _merge_ts(ts, sub_ts, inst_name, port_map, search_dirs)
 
-    _flatten_from._processing.discard(mod_name)
+    _processing.discard(mod_name)
     return ts
 
 

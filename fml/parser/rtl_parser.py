@@ -6,6 +6,26 @@ from pyslang.parsing import TokenKind
 from ..ir.transition_system import TransitionSystem
 
 
+def _z3_slt(a, b):
+    ctx = a.ctx
+    return z3.BoolRef(z3.Z3_mk_bvslt(ctx.ref(), a.as_ast(), b.as_ast()), ctx)
+
+
+def _z3_sle(a, b):
+    ctx = a.ctx
+    return z3.BoolRef(z3.Z3_mk_bvsle(ctx.ref(), a.as_ast(), b.as_ast()), ctx)
+
+
+def _z3_sgt(a, b):
+    ctx = a.ctx
+    return z3.BoolRef(z3.Z3_mk_bvsgt(ctx.ref(), a.as_ast(), b.as_ast()), ctx)
+
+
+def _z3_sge(a, b):
+    ctx = a.ctx
+    return z3.BoolRef(z3.Z3_mk_bvsge(ctx.ref(), a.as_ast(), b.as_ast()), ctx)
+
+
 class RTLParser:
     def __init__(self):
         self.driver = Driver()
@@ -73,6 +93,33 @@ class RTLParser:
             if name not in ts.params:
                 ts.add_param(name, w, init_val)
 
+    def _is_signed_expr(self, node) -> bool:
+        ts = getattr(self, '_current_ts', None)
+        if ts is None or not ts.signed_vars:
+            return False
+        k = node.kind
+        if k == SyntaxKind.IdentifierName:
+            name = self._token_text(node.identifier)
+            return name in ts.signed_vars
+        if hasattr(node, 'left') and node.left is not None and hasattr(node.left, 'kind'):
+            if self._is_signed_expr(node.left):
+                return True
+        if hasattr(node, 'right') and node.right is not None and hasattr(node.right, 'kind'):
+            if self._is_signed_expr(node.right):
+                return True
+        if hasattr(node, 'operand') and node.operand is not None and hasattr(node.operand, 'kind'):
+            if self._is_signed_expr(node.operand):
+                return True
+        return False
+
+    def _is_signed_type(self, node) -> bool:
+        if hasattr(node, 'signing') and node.signing is not None:
+            sk = node.signing.kind
+            if hasattr(sk, 'name'):
+                return 'Signed' in sk.name
+            return sk == TokenKind.SignedKeyword
+        return False
+
     def _extract_ports(self, header, ts: TransitionSystem):
         last_direction = None
         for port in header.ports:
@@ -87,10 +134,15 @@ class RTLParser:
                 direction = last_direction or "input"
             if width is None or width <= 0:
                 width = 1
+            signed = False
+            if hasattr(port.header, 'dataType') and port.header.dataType is not None:
+                signed = self._is_signed_type(port.header.dataType)
             if direction == "input":
-                ts.add_input(name, width)
+                ts.add_input(name, width, signed=signed)
             elif direction == "output":
-                ts.add_state_var(name, width)
+                ts.add_state_var(name, width, signed=signed)
+            elif direction == "inout":
+                ts.add_state_var(name, width, signed=signed)
 
     def _token_text(self, tok) -> str:
         if hasattr(tok, 'valueText'):
@@ -126,6 +178,11 @@ class RTLParser:
 
     def _extract_width_from_node(self, node) -> int | None:
         if node.kind == SyntaxKind.ImplicitType:
+            if hasattr(node, 'dimensions') and node.dimensions:
+                for dim in node.dimensions:
+                    w = self._dimension_width(dim)
+                    if w is not None and w > 1:
+                        return w
             return None
         if hasattr(node, 'dimensions') and node.dimensions:
             for dim in node.dimensions:
@@ -183,6 +240,10 @@ class RTLParser:
                 pass
             elif k == SyntaxKind.ParameterDeclarationStatement:
                 self._process_parameter_declaration(member, ts)
+            elif k == SyntaxKind.HierarchyInstantiation:
+                pass
+            elif k == SyntaxKind.ModuleInstantiation:
+                pass
             else:
                 warnings.warn(f"Unhandled module member: {k}", stacklevel=2)
 
@@ -325,6 +386,10 @@ class RTLParser:
             pass
         elif k == SyntaxKind.ParameterDeclarationStatement:
             self._process_parameter_declaration(node, ts)
+        elif k == SyntaxKind.HierarchyInstantiation:
+            pass
+        elif k == SyntaxKind.ModuleInstantiation:
+            pass
         else:
             warnings.warn(f"Unhandled generate member: {k}", stacklevel=2)
         if genvar_subst:
@@ -423,10 +488,11 @@ class RTLParser:
         w = self._extract_width_from_node(node.type)
         if w is None or w <= 0:
             w = 1
+        signed = self._is_signed_type(node.type)
         for decl in node.declarators:
             name = self._token_text(decl.name)
             if name not in ts.state_vars and name not in ts.inputs:
-                ts.add_state_var(name, w)
+                ts.add_state_var(name, w, signed=signed)
 
     def _signal_width(self, name: str, ts: TransitionSystem) -> int:
         if name in ts.state_vars:
@@ -995,30 +1061,41 @@ class RTLParser:
         if k == SyntaxKind.ArithmeticShiftRightExpression:
             l = self._node_to_z3(node.left)
             r = self._node_to_z3(node.right)
+            use_signed = self._is_signed_expr(node.left)
+            if use_signed:
+                return z3.AShr(l, r)
             return l >> r
 
         if k == SyntaxKind.GreaterThanExpression:
             l = self._node_to_z3(node.left)
             r = self._node_to_z3(node.right)
             l, r = self._z3_promote_pair(l, r)
+            if self._is_signed_expr(node.left) or self._is_signed_expr(node.right):
+                return z3.If(_z3_sgt(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
             return z3.If(z3.UGT(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
 
         if k == SyntaxKind.GreaterThanEqualExpression:
             l = self._node_to_z3(node.left)
             r = self._node_to_z3(node.right)
             l, r = self._z3_promote_pair(l, r)
+            if self._is_signed_expr(node.left) or self._is_signed_expr(node.right):
+                return z3.If(_z3_sge(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
             return z3.If(z3.UGE(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
 
         if k == SyntaxKind.LessThanExpression:
             l = self._node_to_z3(node.left)
             r = self._node_to_z3(node.right)
             l, r = self._z3_promote_pair(l, r)
+            if self._is_signed_expr(node.left) or self._is_signed_expr(node.right):
+                return z3.If(_z3_slt(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
             return z3.If(z3.ULT(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
 
         if k == SyntaxKind.LessThanEqualExpression:
             l = self._node_to_z3(node.left)
             r = self._node_to_z3(node.right)
             l, r = self._z3_promote_pair(l, r)
+            if self._is_signed_expr(node.left) or self._is_signed_expr(node.right):
+                return z3.If(_z3_sle(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
             return z3.If(z3.ULE(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
 
         if k == SyntaxKind.ConditionalExpression:
@@ -1158,14 +1235,24 @@ class RTLParser:
 
         return z3.BitVecVal(0, 1)
 
-    def parse_to_ts(self, filepath: str) -> TransitionSystem:
+    def parse_to_ts(self, filepath: str, top_name: str = None) -> TransitionSystem:
         systems = self.parse_file(filepath)
         if not systems:
             raise RuntimeError("No modules found")
+        if top_name:
+            for ts in systems:
+                if ts.name == top_name:
+                    return ts
+            raise RuntimeError(f"Module '{top_name}' not found in {filepath}")
         return systems[0]
 
-    def parse_text_to_ts(self, text: str) -> TransitionSystem:
+    def parse_text_to_ts(self, text: str, top_name: str = None) -> TransitionSystem:
         systems = self.parse_text(text)
         if not systems:
             raise RuntimeError("No modules found")
+        if top_name:
+            for ts in systems:
+                if ts.name == top_name:
+                    return ts
+            raise RuntimeError(f"Module '{top_name}' not found")
         return systems[0]

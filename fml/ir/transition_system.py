@@ -13,11 +13,13 @@ class StateVar:
 
 
 class TransitionSystem:
-    def __init__(self, name: str = "design"):
+    def __init__(self, name: str = "design", timeout: int = 60000):
         self.name = name
+        self.timeout = timeout
         self.state_vars: dict[str, StateVar] = {}
         self.inputs: dict[str, StateVar] = {}
         self.params: dict[str, tuple[int, int | None]] = {}
+        self.signed_vars: set[str] = set()
         self._cur: dict[str, z3.BitVec] = {}
         self._next: dict[str, z3.BitVec] = {}
         self._inps: dict[str, z3.BitVec] = {}
@@ -30,7 +32,7 @@ class TransitionSystem:
         self._comb_constraints: list[z3.BoolRef] = []
         self._next_state_exprs: dict[str, z3.BitVec] = {}
 
-    def add_state_var(self, name: str, width: int, init_val: int = 0):
+    def add_state_var(self, name: str, width: int, init_val: int = 0, signed: bool = False):
         sv = StateVar(name, width, init_val)
         self.state_vars[name] = sv
         self._cur[name] = z3.BitVec(f"{name}", width)
@@ -38,11 +40,15 @@ class TransitionSystem:
         self._init_constraints.append(
             self._cur[name] == z3.BitVecVal(init_val, width)
         )
+        if signed:
+            self.signed_vars.add(name)
 
-    def add_input(self, name: str, width: int):
+    def add_input(self, name: str, width: int, signed: bool = False):
         iv = StateVar(name, width)
         self.inputs[name] = iv
         self._inps[name] = z3.BitVec(f"{name}_inp", width)
+        if signed:
+            self.signed_vars.add(name)
 
     def set_next_state(self, name: str, expr: z3.BitVecRef):
         self._next_state_exprs[name] = expr

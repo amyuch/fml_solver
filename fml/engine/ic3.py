@@ -58,14 +58,22 @@ class IC3:
 
         # Base case: check if any initial state violates P
         s0 = z3.Solver()
-        s0.set("timeout", 60000)
+        s0.set("timeout", self.ts.timeout)
         s0.add(ts.init_expr)
         s0.add(ts.assumption_expr)
         s0.add(z3.Not(P))
         if s0.check() == z3.sat:
             if verbose:
                 print(f"      counterexample at initial state")
-            return {"result": "fail", "property": pname, "bound": 0}
+            m = s0.model()
+            trace = []
+            frame = {}
+            for name in ts.state_vars:
+                frame[name] = m.eval(ts.get_cur(name))
+            trace.append(frame)
+            return {"result": "fail", "property": pname, "bound": 0,
+                    "counterexample": trace,
+                    "trace": self._format_cex(trace)}
 
         frames: list[list[z3.BoolRef]] = [[] for _ in range(self.max_frames + 2)]
         frames[0].append(ts.init_expr)
@@ -77,10 +85,13 @@ class IC3:
             if verbose:
                 print(f"    frame {k}")
             ok = self._strengthen(k, frames, P, P_next, ts, verbose)
-            if ok is False:
+            if isinstance(ok, dict) and ok.get("result") == "fail":
                 if verbose:
-                    print(f"      counter-example found")
-                return {"result": "fail", "property": pname, "cube": "found"}
+                    print(f"      counter-example found (depth {ok.get('bound', '?')})")
+                trace = ok.get("trace", [])
+                return {"result": "fail", "property": pname, "bound": ok.get("bound", 0),
+                        "counterexample": trace,
+                        "trace": self._format_cex(trace)}
             if ok == "proved":
                 return {"result": "proved", "property": pname, "k": k - 1}
             if ok is None:
@@ -102,9 +113,26 @@ class IC3:
 
         return {"result": "unknown", "property": pname, "bound": self.max_frames}
 
+    def _format_cex(self, trace):
+        if not trace:
+            return "Counterexample: (empty)"
+        lines = ["=" * 60, "Counterexample Trace:", "=" * 60]
+        for step, frame in enumerate(trace):
+            lines.append(f"\n--- Cycle {step} ---")
+            for name, val in frame.items():
+                if val is None:
+                    continue
+                val_str = str(val)
+                if val_str == name:
+                    continue
+                lines.append(f"  {name} = {val}")
+        return "\n".join(lines)
+
     # ── Strengthening with CTI Priority Queue ──────────────────────────────
 
-    def _strengthen(self, k: int, frames, P, P_next, ts, verbose) -> bool | str:
+    _cube_objs: dict = {}
+
+    def _strengthen(self, k: int, frames, P, P_next, ts, verbose) -> bool | str | dict:
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
         ts_cn = z3.substitute(ts.comb_expr, *cur_to_next)
 
@@ -117,6 +145,9 @@ class IC3:
             cur_str = f"__{name}__cur"
             if cur_str in p_str:
                 p_var_strs.add(cur_str)
+
+        cex_next = {}
+        cex_state = {}
 
         def _cti_signature(cube):
             if z3.is_and(cube):
@@ -136,6 +167,88 @@ class IC3:
             heappush(heap, (i, seq, cube))
             seq += 1
 
+        def _extract_state_vals(model):
+            vals = {}
+            for name in ts.state_vars:
+                try:
+                    v = model.eval(ts.get_cur(name))
+                    vals[name] = v if str(v) != str(ts.get_cur(name)) else None
+                except Exception:
+                    vals[name] = None
+            for name in ts.inputs:
+                try:
+                    v = model.eval(ts.get_inp(name))
+                    vals[f"{name}_inp"] = v if str(v) != str(ts.get_inp(name)) else None
+                except Exception:
+                    vals[f"{name}_inp"] = None
+            return vals
+
+        def _cube_to_state(cube):
+            vals = {}
+            if z3.is_and(cube):
+                lits = cube.children()
+            else:
+                lits = [cube]
+            cur_names = {str(ts.get_cur(name)): name for name in ts.state_vars}
+            inp_names = {str(ts.get_inp(name)): name for name in ts.inputs}
+            for lit in lits:
+                if z3.is_eq(lit):
+                    a, b = lit.children()
+                    sa, sb = str(a), str(b)
+                    if sa in cur_names:
+                        vals[cur_names[sa]] = b
+                    elif sb in cur_names:
+                        vals[cur_names[sb]] = a
+                    if sa in inp_names:
+                        vals[f"{inp_names[sa]}_inp"] = b
+                    elif sb in inp_names:
+                        vals[f"{inp_names[sb]}_inp"] = a
+            return vals
+
+        def _build_cex_trace(init_model, first_cube):
+            trace = [_extract_state_vals(init_model)]
+            cur_key = str(first_cube)
+            keys_seen = set()
+            while cur_key in cex_next and cur_key not in keys_seen:
+                keys_seen.add(cur_key)
+                if cur_key in cex_state:
+                    trace.append(cex_state[cur_key])
+                else:
+                    cube_obj = IC3._cube_objs.get(cur_key)
+                    if cube_obj is not None:
+                        trace.append(_cube_to_state(cube_obj))
+                    else:
+                        break
+                cur_key = cex_next[cur_key]
+            if cur_key in cex_state:
+                trace.append(cex_state[cur_key])
+            else:
+                cube_obj = IC3._cube_objs.get(cur_key)
+                if cube_obj is not None:
+                    trace.append(_cube_to_state(cube_obj))
+            # Compute the violating next state from the final CTI cube
+            final_cube = IC3._cube_objs.get(cur_key)
+            if final_cube is not None:
+                ns = z3.Solver()
+                ns.set("timeout", 2000)
+                cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
+                ns.add(final_cube)
+                ns.add(ts.assumption_expr)
+                ns.add(ts.comb_expr)
+                ns.add(ts.trans_expr)
+                ns.add(z3.substitute(ts.comb_expr, *cur_to_next))
+                ns.add(z3.Not(P_next))
+                if ns.check() == z3.sat:
+                    nm = ns.model()
+                    nv = {}
+                    for name in ts.state_vars:
+                        try:
+                            nv[name] = nm.eval(ts.get_next(name))
+                        except Exception:
+                            nv[name] = None
+                    trace.append(nv)
+            return trace
+
         seen_cti = set()
 
         for attempt in range(self.max_blocking):
@@ -143,7 +256,7 @@ class IC3:
                 i, _, cube = heappop(heap)
             else:
                 s = z3.Solver()
-                s.set("timeout", 60000)
+                s.set("timeout", ts.timeout)
                 for clause in frames[k - 1]:
                     s.add(clause)
                 s.add(P)
@@ -159,6 +272,7 @@ class IC3:
                     return True
                 model = s.model()
                 cube = self._extract_cube(model, ts)
+                IC3._cube_objs[str(cube)] = cube
                 sig = _cti_signature(cube)
                 if sig in seen_cti:
                     if verbose:
@@ -172,11 +286,6 @@ class IC3:
 
             if i >= 0 and self._is_blocked(cube, i, frames, ts):
                 continue
-
-            if i == -1:
-                if verbose:
-                    print(f"      CEX at init")
-                return False
 
             result = self._check_predecessor(cube, i, frames, P, ts)
             if result is None:
@@ -192,9 +301,14 @@ class IC3:
             if i == 0:
                 if verbose:
                     print(f"      CEX: predecessor reachable from init")
-                return False
+                trace = _build_cex_trace(result, cube)
+                return {"result": "fail", "trace": trace, "bound": len(trace) - 1}
 
             pred_cube = self._extract_cube(result, ts)
+            cex_state[str(pred_cube)] = _extract_state_vals(result)
+            cex_next[str(pred_cube)] = str(cube)
+            IC3._cube_objs[str(cube)] = cube
+            IC3._cube_objs[str(pred_cube)] = pred_cube
             _push_cube(cube, i)
             _push_cube(pred_cube, i - 1)
 
@@ -242,7 +356,7 @@ class IC3:
     def _check_predecessor(self, cube, i, frames, P, ts):
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
         s = z3.Solver()
-        s.set("timeout", 60000)
+        s.set("timeout", ts.timeout if 'ts' in dir() else self.ts.timeout)
         if i == 0:
             s.add(ts.init_expr)
         else:

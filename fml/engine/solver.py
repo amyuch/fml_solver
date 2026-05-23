@@ -31,7 +31,7 @@ def unfold_transition_system(
     ts: TransitionSystem, k: int
 ) -> tuple[list[dict[str, z3.BitVecRef]], list[dict[str, z3.BitVecRef]], z3.Solver]:
     solver = z3.Solver()
-    solver.set("timeout", 60000)
+    solver.set("timeout", ts.timeout)
 
     state_snapshots = []
     input_snapshots = []
