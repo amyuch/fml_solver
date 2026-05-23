@@ -563,11 +563,19 @@ class RTLParser:
                 self._current_ts.add_state_var(name, w)
                 base = self._current_ts.get_cur(name)
 
+            def _zext(expr, target_w):
+                ew = expr.size()
+                if ew < target_w:
+                    return z3.ZeroExt(target_w - ew, expr)
+                return expr
+
             result = base
             for sel in node.selectors:
                 if sel.kind == SyntaxKind.ElementSelect:
                     selector = sel.selector
-                    if selector.kind == SyntaxKind.SimpleRangeSelect:
+                    sk = selector.kind
+
+                    if sk == SyntaxKind.SimpleRangeSelect:
                         left_val = self._node_to_z3(selector.left)
                         right_val = self._node_to_z3(selector.right)
                         if z3.is_bv_value(left_val) and z3.is_bv_value(right_val):
@@ -579,11 +587,33 @@ class RTLParser:
                             if w_sel == w:
                                 return result
                             result = z3.Extract(hi, lo, result)
-                    elif selector.kind == SyntaxKind.BitSelect:
+                        else:
+                            base_z = _zext(result, w + selector.right.size())
+                            shift = _zext(left_val, w)
+                            result = z3.Extract(right_val.size() - 1, 0, z3.LShR(result, shift))
+
+                    elif sk == SyntaxKind.BitSelect:
                         idx = self._node_to_z3(selector.expr)
                         if z3.is_bv_value(idx):
                             bit = idx.as_long()
                             result = z3.Extract(bit, bit, result)
+                        else:
+                            shift = _zext(idx, w)
+                            result = z3.Extract(0, 0, z3.LShR(result, shift))
+
+                    elif sk == SyntaxKind.AscendingRangeSelect:
+                        base_expr = self._node_to_z3(selector.left)
+                        width_val = self._node_to_z3(selector.right)
+                        sw = width_val.as_long() if z3.is_bv_value(width_val) else 1
+                        shift = _zext(base_expr, w)
+                        result = z3.Extract(sw - 1, 0, z3.LShR(result, shift))
+
+                    elif sk == SyntaxKind.DescendingRangeSelect:
+                        base_expr = self._node_to_z3(selector.left)
+                        width_val = self._node_to_z3(selector.right)
+                        sw = width_val.as_long() if z3.is_bv_value(width_val) else 1
+                        shift = _zext(base_expr - (sw - 1), w)
+                        result = z3.Extract(sw - 1, 0, z3.LShR(result, shift))
             return result
 
         if k == SyntaxKind.IntegerLiteralExpression:
