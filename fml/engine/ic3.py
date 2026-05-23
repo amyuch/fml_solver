@@ -26,13 +26,12 @@ class IC3:
                 return result
             results.append(result)
 
-        for tpname, _ in ts.trans_properties:
+        if ts.trans_properties:
             if verbose:
-                print(f"  IC3 (k-ind fallback) proving: {tpname}")
+                print(f"  IC3 (k-ind fallback) for {len(ts.trans_properties)} trans properties...")
             result = check_kinduction(ts, self.max_frames, verbose=verbose)
             if result["result"] == "fail":
-                return {"result": result["result"], "property": tpname,
-                        "k": result.get("k"), "trace": result.get("trace")}
+                return result
             results.append(result)
 
         proved = all(r["result"] == "proved" for r in results)
