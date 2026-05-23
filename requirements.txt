@@ -1,0 +1,2 @@
+z3-solver>=4.16
+pyslang>=11.0

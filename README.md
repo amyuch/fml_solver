@@ -5,12 +5,9 @@ A formal verification engine that parses real SystemVerilog (SV2017) RTL designs
 ## Features
 
 - **Parser**: SV2017 RTL to Z3 transition system using pyslang. Handles `always_ff`, `always_comb`, `assign`, system functions (`$rose`/`$fell`/`$stable`/`$past`), multi-module flattening, and `assume`/`cover`/`assert property` directives.
-
 - **BMC (Bounded Model Checking)**: Incremental BMC with per-property binary search for minimum counterexample depth.
-
 - **k-Induction**: Proves safety properties that hold for all depths.
-
-- **IC3/PDR (Property Directed Reachability)**: With CTI priority queue, unsat-core generalization, clause subsumption, CTI deduplication (spinning detection), and BMC fallback.
+- **IC3/PDR (Property Directed Reachability)**: With CTI priority queue, unsat-core generalization, clause subsumption, CTI deduplication, and BMC fallback.
 
 ## Project Structure
 
@@ -28,9 +25,16 @@ main.py          — CLI entry point
 ## Usage
 
 ```bash
-python main.py --solver bmc <file.sv> [--max-depth 100]
-python main.py --solver ic3 <file.sv> [--max-frames 50]
-python main.py --solver kind <file.sv> [--max-depth 20]
+python main.py --bmc 100 design.sv
+python main.py --ic3 design.sv
+python main.py --kind 20 design.sv
+python main.py --text 'module ...' --bmc 50
+```
+
+## Installation
+
+```bash
+pip install -r requirements.txt
 ```
 
 ## Requirements
