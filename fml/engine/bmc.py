@@ -66,41 +66,50 @@ def bmc_incremental(ts: TransitionSystem, max_k: int, verbose: bool = True) -> d
     if not ts.properties and not ts.trans_properties:
         return {"result": "unknown", "reason": "no properties"}
 
-    best_result = None
+    failures = []
 
     for pname, p_expr in ts.properties:
         if verbose:
             print(f"  BMC binary search [0, {max_k}] for {pname}...")
         lo, hi = 0, max_k
+        best = None
         while lo <= hi:
             mid = (lo + hi) // 2
             if verbose:
                 print(f"    depth: {mid}...")
             r = _bmc_check_one(ts, pname, p_expr, mid)
             if r is not None:
-                best_result = r
+                best = r
                 hi = mid - 1
             else:
                 lo = mid + 1
+        if best is not None:
+            failures.append(best)
 
     for tpname, tp_expr in ts.trans_properties:
         if verbose:
             print(f"  BMC binary search [0, {max_k}] for {tpname}...")
         lo, hi = 1, max_k
+        best = None
         while lo <= hi:
             mid = (lo + hi) // 2
             if verbose:
                 print(f"    depth: {mid}...")
             r = _bmc_check_one(ts, tpname, tp_expr, mid, is_trans=True)
             if r is not None:
-                best_result = r
+                best = r
                 hi = mid - 1
             else:
                 lo = mid + 1
+        if best is not None:
+            failures.append(best)
 
-    if best_result is not None:
+    if failures:
+        first = failures[0]
         if verbose:
-            print(f"  Minimum CEX depth: {best_result['bound']} ({best_result['property']})")
-        return best_result
+            names = ", ".join(f.get("property", "?") for f in failures)
+            print(f"  Failures: {names}")
+        first["failures"] = failures
+        return first
 
     return {"result": "pass", "bound": max_k}

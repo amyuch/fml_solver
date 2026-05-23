@@ -48,9 +48,12 @@ def check_kinduction(ts: TransitionSystem, k: int, verbose: bool = True) -> dict
     if not props and not trans_props:
         return {"result": "unknown", "reason": "no properties"}
 
-    results = []
+    failures = []
+    proved_count = 0
+    total_count = 0
 
     for pname, p_expr in props:
+        total_count += 1
         state_v = [ts.state_vector(f"_{i}") for i in range(k + 2)]
         inp_v = [ts.input_vector(f"_inp{i}") for i in range(k + 2)]
 
@@ -70,12 +73,13 @@ def check_kinduction(ts: TransitionSystem, k: int, verbose: bool = True) -> dict
 
         result = base_s.check()
         if result == z3.sat:
-            return {
+            failures.append({
                 "result": "fail",
                 "property": pname,
                 "stage": "base",
                 "bound": k,
-            }
+            })
+            continue
 
         ind_s = z3.Solver()
         ind_s.set("timeout", 60000)
@@ -92,13 +96,11 @@ def check_kinduction(ts: TransitionSystem, k: int, verbose: bool = True) -> dict
         if result == z3.unsat:
             if verbose:
                 print(f"  k-induction proved {pname} with k={k}")
-            results.append("proved")
-        else:
-            results.append("unknown")
+            proved_count += 1
 
     for tpname, tp_expr in trans_props:
+        total_count += 1
         if k < 1:
-            results.append("unknown")
             continue
 
         state_v = [ts.state_vector(f"_{i}") for i in range(k + 3)]
@@ -120,12 +122,13 @@ def check_kinduction(ts: TransitionSystem, k: int, verbose: bool = True) -> dict
 
         result = base_s.check()
         if result == z3.sat:
-            return {
+            failures.append({
                 "result": "fail",
                 "property": tpname,
                 "stage": "base",
                 "bound": k,
-            }
+            })
+            continue
 
         ind_s = z3.Solver()
         ind_s.set("timeout", 60000)
@@ -142,10 +145,13 @@ def check_kinduction(ts: TransitionSystem, k: int, verbose: bool = True) -> dict
         if result == z3.unsat:
             if verbose:
                 print(f"  k-induction proved {tpname} with k={k}")
-            results.append("proved")
-        else:
-            results.append("unknown")
+            proved_count += 1
 
-    if all(r == "proved" for r in results):
+    if failures:
+        first = failures[0]
+        first["failures"] = failures
+        return first
+
+    if total_count > 0 and proved_count == total_count:
         return {"result": "proved", "bound": k}
     return {"result": "unknown", "bound": k}

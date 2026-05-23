@@ -18,24 +18,36 @@ class IC3:
         if not ts.properties and not ts.trans_properties:
             return {"result": "unknown", "reason": "no properties"}
 
-        results = []
+        failures = []
+        all_proved = True
 
         for pname, p_expr in ts.properties:
             result = self._prove_property(p_expr, pname, verbose)
             if result["result"] == "fail":
-                return result
-            results.append(result)
+                failures.append(result)
+                all_proved = False
+            elif result["result"] == "proved":
+                pass
+            else:
+                all_proved = False
 
         if ts.trans_properties:
             if verbose:
                 print(f"  IC3 (k-ind fallback) for {len(ts.trans_properties)} trans properties...")
-            result = check_kinduction(ts, self.max_frames, verbose=verbose)
-            if result["result"] == "fail":
-                return result
-            results.append(result)
+            kind_result = check_kinduction(ts, self.max_frames, verbose=verbose)
+            if kind_result["result"] == "fail":
+                kind_fails = kind_result.get("failures", [kind_result])
+                failures.extend(kind_fails)
+                all_proved = False
+            elif kind_result["result"] != "proved":
+                all_proved = False
 
-        proved = all(r["result"] == "proved" for r in results)
-        if proved:
+        if failures:
+            first = failures[0]
+            first["failures"] = failures
+            return first
+
+        if all_proved and (ts.properties or ts.trans_properties):
             return {"result": "proved", "bound": self.max_frames}
         return {"result": "unknown", "bound": self.max_frames}
 
