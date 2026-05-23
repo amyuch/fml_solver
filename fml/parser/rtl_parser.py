@@ -153,10 +153,17 @@ class RTLParser:
                 self._process_cont_assign(member, ts)
             elif k == SyntaxKind.ConcurrentAssertionMember:
                 self._process_assertion(member, ts)
-            elif k == SyntaxKind.AssertPropertyStatement:
-                self._process_assertion(member, ts)
-            elif k == SyntaxKind.AssumePropertyStatement:
-                self._process_assertion(member, ts)
+            elif k == SyntaxKind.DataDeclaration:
+                self._process_data_declaration(member, ts)
+
+    def _process_data_declaration(self, node, ts: TransitionSystem):
+        w = self._extract_width_from_node(node.type)
+        if w is None or w <= 0:
+            w = 1
+        for decl in node.declarators:
+            name = self._token_text(decl.name)
+            if name not in ts.state_vars and name not in ts.inputs:
+                ts.add_state_var(name, w)
 
     def _signal_width(self, name: str, ts: TransitionSystem) -> int:
         if name in ts.state_vars:
@@ -359,11 +366,20 @@ class RTLParser:
                 r_expr = self._node_to_z3(right)
                 ts.add_comb_constraint(ts.get_cur(lname) == r_expr)
 
-    def _process_assertion(self, stmt, ts: TransitionSystem):
+    def _process_assertion(self, stmt, ts: TransitionSystem,
+                           directive: str | None = None):
         self._current_ts = ts
 
         if stmt.kind == SyntaxKind.ConcurrentAssertionMember:
             stmt = stmt.statement
+
+        if directive is None:
+            if stmt.kind == SyntaxKind.AssumePropertyStatement:
+                directive = "assume"
+            elif stmt.kind == SyntaxKind.CoverPropertyStatement:
+                directive = "cover"
+            else:
+                directive = "assert"
 
         if not hasattr(stmt, 'propertySpec') or stmt.propertySpec is None:
             return
@@ -376,7 +392,15 @@ class RTLParser:
         if hasattr(ps, 'expr') and ps.expr is not None:
             result = self._property_to_z3(ps.expr, clock, ts)
             if result is not None:
-                ts.add_property(f"assert_{len(ts.properties)}", result)
+                if directive == "assume":
+                    prefix = f"assume_{len(ts.assumptions)}"
+                    ts.add_assumption(result)
+                elif directive == "cover":
+                    prefix = f"cover_{len(ts.cover_properties)}"
+                    ts.add_cover_property(prefix, result)
+                else:
+                    prefix = f"assert_{len(ts.properties)}"
+                    ts.add_property(prefix, result)
 
     def _property_to_z3(self, node, clock: str | None, ts: TransitionSystem) -> z3.BoolRef | None:
         k = node.kind

@@ -6,72 +6,86 @@ from .solver import (
 from ..ir.transition_system import TransitionSystem
 
 
-def check_bmc(ts: TransitionSystem, k: int, verbose: bool = True) -> dict:
-    props = ts.properties
-    trans_props = ts.trans_properties
+def _bmc_check_one(ts, pname, p_expr, k, is_trans=False):
+    state_snapshots, input_snapshots, solver = unfold_transition_system(ts, k)
 
-    if not props and not trans_props:
-        return {"result": "unknown", "reason": "no properties"}
-
-    for pname, p_expr in props:
-        state_snapshots, input_snapshots, solver = unfold_transition_system(ts, k)
-
+    if not is_trans:
         p_at_k = z3.substitute(
             p_expr,
             *[(ts.get_cur(name), state_snapshots[k][name]) for name in ts.state_vars]
         )
-
         solver.add(z3.simplify(z3.Not(p_at_k)))
-
-        result = solver.check()
-        if result == z3.sat:
-            model = solver.model()
-            cex = extract_counterexample(model, ts, state_snapshots, input_snapshots, k)
-            return {
-                "result": "fail",
-                "property": pname,
-                "bound": k,
-                "counterexample": cex,
-                "trace": format_counterexample(cex, ts),
-            }
-
-    for tpname, tp_expr in trans_props:
+    else:
         if k < 1:
-            continue
-        state_snapshots, input_snapshots, solver = unfold_transition_system(ts, k)
-
+            return None
         tp_violations = []
         for i in range(k):
             tp_at_i = z3.substitute(
-                tp_expr,
+                p_expr,
                 *[(ts.get_cur(name), state_snapshots[i][name]) for name in ts.state_vars],
                 *[(ts.get_next(name), state_snapshots[i+1][name]) for name in ts.state_vars],
                 *[(ts.get_inp(name), input_snapshots[i][name]) for name in ts.inputs],
             )
             tp_violations.append(z3.simplify(z3.Not(tp_at_i)))
-
+        if not tp_violations:
+            return None
         solver.add(z3.Or(*tp_violations))
 
-        result = solver.check()
-        if result == z3.sat:
-            model = solver.model()
-            cex = extract_counterexample(model, ts, state_snapshots, input_snapshots, k)
-            return {
-                "result": "fail",
-                "property": tpname,
-                "bound": k,
-                "counterexample": cex,
-                "trace": format_counterexample(cex, ts),
-            }
+    result = solver.check()
+    if result == z3.sat:
+        model = solver.model()
+        cex = extract_counterexample(model, ts, state_snapshots, input_snapshots, k)
+        return {
+            "result": "fail",
+            "property": pname,
+            "bound": k,
+            "counterexample": cex,
+            "trace": format_counterexample(cex, ts),
+        }
+    return None
+
+
+def check_bmc(ts: TransitionSystem, k: int) -> dict:
+    if not ts.properties and not ts.trans_properties:
+        return {"result": "unknown", "reason": "no properties"}
+
+    for pname, p_expr in ts.properties:
+        r = _bmc_check_one(ts, pname, p_expr, k)
+        if r is not None:
+            return r
+
+    for tpname, tp_expr in ts.trans_properties:
+        r = _bmc_check_one(ts, tpname, tp_expr, k, is_trans=True)
+        if r is not None:
+            return r
 
     return {"result": "pass", "bound": k}
 
 
 def bmc_incremental(ts: TransitionSystem, max_k: int, verbose: bool = True) -> dict:
-    for k in range(max_k + 1):
+    if not ts.properties and not ts.trans_properties:
+        return {"result": "unknown", "reason": "no properties"}
+
+    best_result = None
+
+    for pname, p_expr in ts.properties:
         if verbose:
-            print(f"  BMC depth: {k}...")
-        result = check_bmc(ts, k, verbose=False)
-        if result["result"] == "fail":
-            return result
+            print(f"  BMC binary search [0, {max_k}] for {pname}...")
+        lo, hi = 0, max_k
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if verbose:
+                print(f"    depth: {mid}...")
+            r = _bmc_check_one(ts, pname, p_expr, mid)
+            if r is not None:
+                best_result = r
+                hi = mid - 1
+            else:
+                lo = mid + 1
+
+    if best_result is not None:
+        if verbose:
+            print(f"  Minimum CEX depth: {best_result['bound']} ({best_result['property']})")
+        return best_result
+
     return {"result": "pass", "bound": max_k}

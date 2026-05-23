@@ -24,6 +24,7 @@ class TransitionSystem:
         self._trans_constraints: list[z3.BoolRef] = []
         self.properties: list[tuple[str, z3.BoolRef]] = []
         self.trans_properties: list[tuple[str, z3.BoolRef]] = []
+        self.cover_properties: list[tuple[str, z3.BoolRef]] = []
         self.assumptions: list[z3.BoolRef] = []
         self._comb_constraints: list[z3.BoolRef] = []
         self._next_state_exprs: dict[str, z3.BitVec] = {}
@@ -57,8 +58,15 @@ class TransitionSystem:
     def add_trans_property(self, name: str, expr: z3.BoolRef):
         self.trans_properties.append((name, expr))
 
+    def add_cover_property(self, name: str, expr: z3.BoolRef):
+        self.cover_properties.append((name, expr))
+
     def add_assumption(self, expr: z3.BoolRef):
         self.assumptions.append(expr)
+
+    @property
+    def assumption_expr(self) -> z3.BoolRef:
+        return z3.And(*self.assumptions) if self.assumptions else z3.BoolVal(True)
 
     def add_comb_constraint(self, expr: z3.BoolRef):
         self._comb_constraints.append(expr)

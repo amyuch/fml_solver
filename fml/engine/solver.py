@@ -62,10 +62,11 @@ def unfold_transition_system(
         input_snapshots.append(inp)
 
         for a in ts.assumptions:
+            inp_map = [(ts.get_inp(name), inp[name]) for name in ts.inputs]
             a_expr = z3.substitute(
                 a,
                 *[(ts.get_cur(name), si[name]) for name in ts.state_vars],
-                *[(ts.get_inp(name), inp[name]) for name in ts.inputs],
+                *inp_map,
             )
             solver.add(z3.simplify(a_expr))
 
@@ -82,6 +83,14 @@ def unfold_transition_system(
         )
         if comb_expr is not None:
             solver.add(z3.simplify(comb_expr))
+
+        for a in ts.assumptions:
+            a_expr = z3.substitute(
+                a,
+                *[(ts.get_cur(name), si[name]) for name in ts.state_vars],
+                *inp_map,
+            )
+            solver.add(z3.simplify(a_expr))
 
     return state_snapshots, input_snapshots, solver
 
