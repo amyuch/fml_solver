@@ -344,6 +344,8 @@ class RTLParser:
     def _extract_name(self, node) -> str | None:
         if node.kind == SyntaxKind.IdentifierName:
             return self._token_text(node.identifier)
+        if node.kind == SyntaxKind.IdentifierSelectName:
+            return self._token_text(node.identifier)
         return None
 
     def _process_expr_stmt(self, stmt, ts: TransitionSystem):
@@ -549,6 +551,40 @@ class RTLParser:
                 return self._current_ts.get_inp(name)
             self._current_ts.add_state_var(name, w)
             return self._current_ts.get_cur(name)
+
+        if k == SyntaxKind.IdentifierSelectName:
+            name = self._token_text(node.identifier)
+            w = self._signal_width(name, self._current_ts)
+            if name in self._current_ts.state_vars:
+                base = self._current_ts.get_cur(name)
+            elif name in self._current_ts.inputs:
+                base = self._current_ts.get_inp(name)
+            else:
+                self._current_ts.add_state_var(name, w)
+                base = self._current_ts.get_cur(name)
+
+            result = base
+            for sel in node.selectors:
+                if sel.kind == SyntaxKind.ElementSelect:
+                    selector = sel.selector
+                    if selector.kind == SyntaxKind.SimpleRangeSelect:
+                        left_val = self._node_to_z3(selector.left)
+                        right_val = self._node_to_z3(selector.right)
+                        if z3.is_bv_value(left_val) and z3.is_bv_value(right_val):
+                            hi = left_val.as_long()
+                            lo = right_val.as_long()
+                            if lo > hi:
+                                lo, hi = hi, lo
+                            w_sel = hi - lo + 1
+                            if w_sel == w:
+                                return result
+                            result = z3.Extract(hi, lo, result)
+                    elif selector.kind == SyntaxKind.BitSelect:
+                        idx = self._node_to_z3(selector.expr)
+                        if z3.is_bv_value(idx):
+                            bit = idx.as_long()
+                            result = z3.Extract(bit, bit, result)
+            return result
 
         if k == SyntaxKind.IntegerLiteralExpression:
             try:
