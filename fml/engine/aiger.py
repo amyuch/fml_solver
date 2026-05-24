@@ -6,59 +6,102 @@ from ..ir.transition_system import TransitionSystem
 
 
 def ts_to_verilog(ts, module_name="top"):
-    """Export a TransitionSystem to Verilog RTL.
+    """Export a TransitionSystem to Verilog RTL (Verilog-95 compatible).
 
     Uses default Z3 variable names matching the parser's naming:
     - State vars: name (current), name_next (next)
     - Inputs: name_inp
-    """
-    lines = [f"module {module_name}(input clk"]
 
-    # Add inputs (skip clk since it was already added)
+    For trans_properties (involving |=> or =>), generates next-state
+    wires so the bad output properly checks future-state conditions.
+
+    Only the `bad` output is exposed as a port — state variables are
+    internal registers. This ensures ABC miter/PDR treats only the
+    property violation as the verification target.
+    """
+    lines = [f"module {module_name}(clk"]
+
     inp_names = [n for n in ts.inputs.keys() if n != "clk"]
     for name in inp_names:
-        w = ts.inputs[name].width
-        if w == 1:
-            lines[-1] += f", input {name}"
-        else:
-            lines[-1] += f", input [{w-1}:0] {name}"
+        lines[-1] += f", {name}"
 
-    # Add state variables as outputs
-    for name in ts.state_vars:
-        w = ts.state_vars[name].width
-        if w == 1:
-            lines[-1] += f", output reg {name}"
-        else:
-            lines[-1] += f", output reg [{w-1}:0] {name}"
+    has_props = bool(ts.properties or ts.trans_properties)
+    if has_props:
+        lines[-1] += ", bad"
 
     lines[-1] += ");"
 
-    # State variables (declared as reg)
+    # Port declarations
+    lines.append("  input clk;")
+    for name in inp_names:
+        w = ts.inputs[name].width
+        if w == 1:
+            lines.append(f"  input {name};")
+        else:
+            lines.append(f"  input [{w-1}:0] {name};")
+
+    # State variables as internal registers
     for name, sv in ts.state_vars.items():
         w = sv.width
         if w == 1:
             lines.append(f"  reg {name};")
         else:
             lines.append(f"  reg [{w-1}:0] {name};")
-        # Init
+
+    if has_props:
+        lines.append("  output bad;")
+
+    # Next-state wires
+    next_wires = {}
+    for name in ts.state_vars:
+        if name in ts._next_state_exprs:
+            w = ts.state_vars[name].width
+            next_name = f"next_{name}"
+            next_wires[name] = next_name
+            if w == 1:
+                lines.append(f"  wire {next_name};")
+            else:
+                lines.append(f"  wire [{w-1}:0] {next_name};")
+
+    # Init
+    for name, sv in ts.state_vars.items():
+        w = sv.width
         init_val = sv.init_val
         lines.append(f"  initial {name} = {w}'d{init_val};")
 
-    # Input variables don't need reg declaration
+    # Next-state logic as combinational assigns
+    for name in ts.state_vars:
+        if name in ts._next_state_exprs:
+            next_name = next_wires[name]
+            expr = ts._next_state_exprs[name]
+            verilog_expr = _z3_to_verilog_expr(expr, ts)
+            lines.append(f"  assign {next_name} = {verilog_expr};")
 
-    # Always_ff block for next-state logic
+    # Sequential always block
     lines.append("")
     lines.append("  always @(posedge clk) begin")
     for name in ts.state_vars:
         if name in ts._next_state_exprs:
-            expr = ts._next_state_exprs[name]
-            verilog_expr = _z3_to_verilog_expr(expr, ts)
-            lines.append(f"    {name} <= {verilog_expr};")
+            lines.append(f"    {name} <= next_{name};")
         else:
             lines.append(f"    {name} <= {name};")
     lines.append("  end")
 
-    # This is a simplified export — complex expressions may not translate perfectly
+    # Bad state logic — property negation
+    if has_props:
+        lines.append("")
+        bad_conds = []
+        for pname, p_expr in ts.properties:
+            viol = _z3_to_verilog_expr(z3.Not(p_expr), ts)
+            bad_conds.append(f"({viol})")
+        for pname, p_expr in ts.trans_properties:
+            viol = _z3_to_verilog_expr(z3.Not(p_expr), ts)
+            bad_conds.append(f"({viol})")
+        if bad_conds:
+            lines.append(f"  assign bad = {' || '.join(bad_conds)};")
+        else:
+            lines.append("  assign bad = 1'b0;")
+
     lines.append("endmodule")
     return "\n".join(lines)
 
@@ -77,7 +120,11 @@ def _z3_to_verilog_expr(expr, ts, paren=False):
         except Exception:
             name = str(expr)
             if name.endswith("_next"):
-                return name[:-5]
+                base = name[:-5]
+                # Use next_ wire name for trans_property references
+                if base in ts.state_vars and base in ts._next_state_exprs:
+                    return f"next_{base}"
+                return base
             if name.endswith("_inp"):
                 orig = name[:-4]
                 if orig in ts.inputs:
@@ -198,7 +245,7 @@ def _z3_to_verilog_expr(expr, ts, paren=False):
 
 def _z3_width(expr):
     try:
-        return expr.sort().bv_size()
+        return expr.sort().size()
     except Exception:
         return 1
 
@@ -212,14 +259,73 @@ def find_abc():
                 return path
         except (FileNotFoundError, subprocess.TimeoutExpired):
             continue
-    # Check if yosys has ABC built in
     try:
         result = subprocess.run(["yosys", "-V"], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
-            return "yosys-abc"  # ABC accessible through yosys
+            return "yosys-abc"
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
     return None
+
+
+def ts_verify_via_abc(ts, yosys_bin="yosys", abc_bin="yosys-abc", timeout=60):
+    """Verify TS properties using yosys + ABC PDR pipeline.
+
+    1. Export TS to Verilog-95 with property encoded as `bad` output
+    2. Yosys synthesizes to BLIF
+    3. ABC strash + PDR on BLIF
+    4. Parse result
+
+    Returns dict with result, or None on failure.
+    """
+    verilog = ts_to_verilog(ts)
+
+    v_path = tempfile.mktemp(suffix=".v")
+    blif_path = tempfile.mktemp(suffix=".blif")
+
+    try:
+        with open(v_path, "w") as f:
+            f.write(verilog)
+
+        # Yosys: read Verilog, synthesize, write BLIF
+        ys_result = subprocess.run(
+            [yosys_bin, "-s", "-"],
+            input=f"read_verilog {v_path}\nsynth -top top\nwrite_blif {blif_path}\n",
+            capture_output=True, text=True, timeout=timeout / 2,
+        )
+        if ys_result.returncode != 0 or not os.path.exists(blif_path):
+            return {"result": "unknown", "engine": "abc_blif",
+                    "error": f"yosys failed: {ys_result.stderr[:200]}"}
+
+        # ABC: read BLIF, strash to AIG, run PDR
+        abc_script = f"read_blif {blif_path}; strash; pdr; print_stats"
+        abc_result = subprocess.run(
+            [abc_bin, "-f", "-"],
+            input=abc_script,
+            capture_output=True, text=True, timeout=timeout / 2,
+        )
+        output = abc_result.stdout + "\n" + abc_result.stderr
+
+        # Parse ABC output — look for PDR result
+        for line in output.split('\n'):
+            if 'was asserted in frame' in line:
+                return {"result": "fail", "engine": "abc_pdr",
+                        "frame": line.strip()}
+            if 'The network was proved' in line or 'Property proved' in line:
+                return {"result": "proved", "engine": "abc_pdr"}
+
+        return {"result": "unknown", "engine": "abc_pdr", "output": output[:500]}
+
+    except FileNotFoundError as e:
+        return {"result": "unknown", "engine": "abc_blif", "error": f"binary not found: {e}"}
+    except subprocess.TimeoutExpired:
+        return {"result": "unknown", "engine": "abc_blif", "error": "timeout"}
+    finally:
+        for p in [v_path, blif_path]:
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
 
 
 def ts_to_aiger(ts, yosys_bin="yosys", output_file=None):
