@@ -1,0 +1,288 @@
+import time
+import z3
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from ..ir.transition_system import TransitionSystem
+from .bmc import bmc_incremental
+from .kind import check_kinduction
+from .ic3 import IC3
+from .simulation import simulation_falsify, simulation_cover
+from .fan_in import compute_fanin_cone, summarize_cone
+
+
+class VerificationResult:
+    def __init__(self, property_name, property_type="state"):
+        self.property_name = property_name
+        self.property_type = property_type
+        self.result = "unknown"  # "proved", "fail", "unknown"
+        self.engine = None
+        self.bound = None
+        self.counterexample = None
+        self.trace = None
+        self.reason = None
+        self.time_taken = 0.0
+        self.engines_tried = []
+
+    def to_dict(self):
+        d = {
+            "result": self.result,
+            "property": self.property_name,
+            "engine": self.engine,
+            "bound": self.bound,
+            "time": self.time_taken,
+            "engines_tried": self.engines_tried,
+        }
+        if self.trace:
+            d["trace"] = self.trace
+        if self.counterexample:
+            d["counterexample"] = self.counterexample
+        if self.reason:
+            d["reason"] = self.reason
+        return d
+
+
+class EngineOrchestrator:
+    def __init__(self, ts, verbose=False):
+        self.ts = ts
+        self.verbose = verbose
+        self._clause_cache = {}  # property_name -> list of inductive clauses
+
+    def verify_all(self, timeout_per_engine=60000, max_bmc=100, max_kind=10):
+        """Verify all properties across all types."""
+        results = {}
+
+        for ptype in ["properties", "trans_properties", "cover_properties"]:
+            prop_list = getattr(self.ts, ptype, [])
+            for pname, p_expr in prop_list:
+                res = self._verify_one(pname, p_expr, ptype,
+                                       timeout_per_engine, max_bmc, max_kind)
+                results[pname] = res
+
+        return results
+
+    def _verify_one(self, pname, p_expr, ptype, timeout, max_bmc, max_kind):
+        res = VerificationResult(pname, ptype)
+
+        if ptype == "cover_properties":
+            return self._handle_cover(pname, p_expr, res)
+
+        # Phase 0: Fan-in cone analysis
+        fanin_state, fanin_inputs = compute_fanin_cone(self.ts, p_expr)
+        if self.verbose:
+            print(summarize_cone(self.ts, p_expr))
+
+        # Phase 1: Quick falsification via random simulation
+        start = time.time()
+        if self.verbose:
+            print(f"  [{pname}] Phase 1: Random simulation...")
+        cex = simulation_falsify(self.ts, max_cycles=200, trials=3, verbose=self.verbose)
+        res.engines_tried.append("simulation")
+        if cex:
+            elapsed = time.time() - start
+            res.result = "fail"
+            res.engine = "simulation"
+            res.bound = cex.get("bound")
+            res.counterexample = cex.get("counterexample")
+            res.trace = cex.get("trace")
+            res.time_taken = elapsed
+            if self.verbose:
+                print(f"  [{pname}] Simulation found CEX at depth {res.bound}")
+            return res
+
+        # Analyze property structure to choose engine strategy
+        prop_type_analysis = self._analyze_property(p_expr, fanin_state)
+
+        # Phase 2: Run engines based on property analysis
+        if prop_type_analysis == "deep_state":
+            # Deep finite-state-machine: k-induction first, then IC3
+            strategy = ["kind", "bmc", "ic3"]
+        elif prop_type_analysis == "datapath":
+            # Datapath-heavy: BMC first (find deep bugs), then IC3
+            strategy = ["bmc", "ic3", "kind"]
+        elif prop_type_analysis == "control":
+            # Control-heavy: IC3 first (good at Boolean reasoning)
+            strategy = ["ic3", "bmc", "kind"]
+        else:
+            strategy = ["bmc", "ic3", "kind"]
+
+        if self.verbose:
+            print(f"  [{pname}] Property type: {prop_type_analysis}")
+            print(f"  [{pname}] Strategy: {strategy}")
+
+        for engine_name in strategy:
+            engine_start = time.time()
+            res.engines_tried.append(engine_name)
+            elapsed_budget = (timeout - (time.time() - start)) / 1000
+
+            if elapsed_budget <= 0:
+                break
+
+            if self.verbose:
+                print(f"  [{pname}] Engine: {engine_name}...")
+
+            if engine_name == "bmc":
+                engine_res = bmc_incremental(self.ts, max_bmc, verbose=self.verbose)
+            elif engine_name == "kind":
+                engine_res = check_kinduction(self.ts, max_kind, verbose=self.verbose)
+            elif engine_name == "ic3":
+                ic3 = IC3(self.ts)
+                engine_res = ic3.prove(verbose=self.verbose)
+            else:
+                continue
+
+            engine_elapsed = time.time() - engine_start
+
+            if engine_res.get("result") == "fail":
+                res.result = "fail"
+                res.engine = engine_name
+                res.bound = engine_res.get("bound")
+                res.counterexample = engine_res.get("counterexample")
+                res.trace = engine_res.get("trace")
+                res.time_taken = time.time() - start
+                if self.verbose:
+                    print(f"  [{pname}] {engine_name} found CEX at depth {res.bound}")
+                return res
+
+            if engine_res.get("result") == "proved":
+                res.result = "proved"
+                res.engine = engine_name
+                res.time_taken = time.time() - start
+                if self.verbose:
+                    print(f"  [{pname}] {engine_name} proved property")
+                return res
+
+            if self.verbose:
+                print(f"  [{pname}] {engine_name}: inconclusive")
+
+        res.time_taken = time.time() - start
+        return res
+
+    def verify_with_strategies(self, strategies, parallel=False):
+        """Run multiple strategies, possibly in parallel. Return first conclusive result."""
+        if not parallel:
+            for strategy in strategies:
+                res = self._run_strategy(strategy)
+                if res.result in ("proved", "fail"):
+                    return res
+            return res
+
+        with ThreadPoolExecutor(max_workers=len(strategies)) as executor:
+            futures = {executor.submit(self._run_strategy, s): s for s in strategies}
+            for future in as_completed(futures):
+                res = future.result()
+                if res.result in ("proved", "fail"):
+                    for f in futures:
+                        f.cancel()
+                    return res
+        return res
+
+    def _run_strategy(self, strategy):
+        """Run a strategy represented as a dict. Returns first conclusive result."""
+        for step in strategy.get("steps", []):
+            engine = step.get("engine")
+            params = step.get("params", {})
+            if engine == "simulation":
+                res = simulation_falsify(self.ts, **params)
+                if res:
+                    return self._to_result(res, "simulation")
+            elif engine == "bmc":
+                res = bmc_incremental(self.ts, **params)
+                if res.get("result") in ("fail", "proved", "pass"):
+                    return self._to_result(res, "bmc")
+            elif engine == "kind":
+                res = check_kinduction(self.ts, **params)
+                if res.get("result") in ("fail", "proved", "pass"):
+                    return self._to_result(res, "kind")
+            elif engine == "ic3":
+                ic3 = IC3(self.ts)
+                res = ic3.prove(**params)
+                if res.get("result") in ("fail", "proved", "pass"):
+                    return self._to_result(res, "ic3")
+
+        return VerificationResult("all")
+
+    def _analyze_property(self, p_expr, fanin_vars):
+        """Analyze a property to determine its type.
+
+        Returns one of: 'deep_state', 'datapath', 'control', 'mixed'
+        """
+        n_state = len(fanin_vars)
+        eq_count = 0
+        cmp_count = 0
+        total_ops = 0
+
+        def walk(e):
+            nonlocal eq_count, cmp_count, total_ops
+            if e is None:
+                return
+            total_ops += 1
+            try:
+                decl = e.decl()
+            except Exception:
+                decl = None
+            if decl is not None:
+                decl_name = decl.name()
+                if "eq" in decl_name.lower() or "=" in decl_name:
+                    eq_count += 1
+                if "lt" in decl_name.lower() or "gt" in decl_name.lower():
+                    cmp_count += 1
+            for child in e.children():
+                walk(child)
+
+        walk(p_expr)
+
+        if n_state <= 10 and total_ops > 0 and eq_count / total_ops > 0.3:
+            return "control"
+        if cmp_count > 2 or n_state > 20:
+            return "datapath"
+        if n_state <= 5:
+            return "deep_state"
+        return "mixed"
+
+    def _handle_cover(self, pname, p_expr, res):
+        start = time.time()
+        cres = simulation_cover(self.ts, max_cycles=200, trials=3, verbose=self.verbose)
+        res.time_taken = time.time() - start
+
+        if cres:
+            for r in cres:
+                if r.get("result") == "reachable" and r.get("property") == pname:
+                    res.result = "reachable"
+                    res.engine = "simulation"
+                    res.bound = r.get("bound")
+                    res.counterexample = r.get("counterexample")
+                    res.trace = r.get("trace")
+                    return res
+
+        res.result = "unknown"
+        res.engine = "simulation"
+        res.reason = "cover_target not reached in simulation"
+        return res
+
+    def _to_result(self, raw, engine_name):
+        r = VerificationResult(raw.get("property", "unknown"))
+        r.result = raw.get("result", "unknown")
+        r.engine = engine_name
+        r.bound = raw.get("bound")
+        r.counterexample = raw.get("counterexample")
+        r.trace = raw.get("trace")
+        r.reason = raw.get("reason")
+        return r
+
+
+def format_orchestrator_results(results, verbose=False):
+    lines = []
+    for pname, res in sorted(results.items()):
+        if res.result == "proved":
+            icon = "  \u2713"
+        elif res.result == "fail":
+            icon = "  \u2717"
+        elif res.result == "reachable":
+            icon = "  R"
+        else:
+            icon = "  ?"
+        lines.append(f"{icon} {pname:40s} {res.result:10s} [{res.engine:12s}] {res.time_taken:.2f}s")
+        if verbose and res.engines_tried:
+            lines.append(f"     engines tried: {', '.join(res.engines_tried)}")
+        if verbose and res.bound is not None:
+            lines.append(f"     bound: {res.bound}")
+    return "\n".join(lines)

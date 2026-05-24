@@ -7,6 +7,9 @@ from fml.parser.rtl_parser import RTLParser
 from fml.engine.bmc import bmc_incremental
 from fml.engine.kind import check_kinduction
 from fml.engine.ic3 import IC3
+from fml.engine.orchestrator import EngineOrchestrator, format_orchestrator_results
+from fml.engine.simulation import simulation_falsify
+from fml.engine.fan_in import compute_fanin_cone, summarize_cone
 
 import z3
 
@@ -19,8 +22,13 @@ def main():
     parser.add_argument("--bmc", type=int, default=0, help="Run BMC up to bound K")
     parser.add_argument("--kind", type=int, default=0, help="Run k-induction with bound K")
     parser.add_argument("--ic3", action="store_true", help="Run IC3/PDR algorithm")
+    parser.add_argument("--auto", action="store_true", help="Auto mode: orchestrator selects best strategy")
+    parser.add_argument("--sim", action="store_true", help="Run random simulation only")
+    parser.add_argument("--fanin", action="store_true", help="Show fan-in cone analysis")
     parser.add_argument("--text", "-t", help="Inline SystemVerilog text")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
+    parser.add_argument("--max-bmc", type=int, default=100, help="Max BMC bound")
+    parser.add_argument("--max-kind", type=int, default=10, help="Max k-induction bound")
 
     args = parser.parse_args()
 
@@ -45,9 +53,39 @@ endmodule
         print("No designs found!")
         return
 
-    print(f"\n{'-' * 60}")
+    print(f"\n{'=' * 60}")
     print(f"Design: {sys.name}")
-    print(f"{'-' * 60}")
+    print(f"{'=' * 60}")
+
+    if args.fanin:
+        for pname, p_expr in sys.properties:
+            print(f"\nProperty: {pname}")
+            print(summarize_cone(sys, p_expr))
+        for pname, p_expr in sys.trans_properties:
+            print(f"\nTrans Property: {pname}")
+            print(summarize_cone(sys, p_expr))
+        return
+
+    if args.sim:
+        print("\n>>> Random Simulation (quick falsification)...")
+        result = simulation_falsify(sys, max_cycles=500, trials=5, verbose=args.verbose)
+        if result:
+            _print_result(result)
+        else:
+            print("  No counterexample found in simulation.")
+        return
+
+    if args.auto:
+        print("\n>>> Auto mode: orchestrating engines...")
+        orch = EngineOrchestrator(sys, verbose=args.verbose)
+        results = orch.verify_all(
+            timeout_per_engine=60000,
+            max_bmc=args.max_bmc,
+            max_kind=args.max_kind,
+        )
+        print()
+        print(format_orchestrator_results(results, verbose=args.verbose))
+        return
 
     if args.bmc > 0:
         print(f"\n>>> Running BMC (bound={args.bmc})...")
@@ -65,7 +103,7 @@ endmodule
         result = ic3.prove(verbose=args.verbose)
         _print_result(result)
 
-    if args.bmc == 0 and args.kind == 0 and not args.ic3:
+    if args.bmc == 0 and args.kind == 0 and not args.ic3 and not args.auto:
         print(sys.summarize())
 
 
