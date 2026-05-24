@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--kind", type=int, default=0, help="Run k-induction with bound K")
     parser.add_argument("--ic3", action="store_true", help="Run IC3/PDR algorithm")
     parser.add_argument("--auto", action="store_true", help="Auto mode: orchestrator selects best strategy")
+    parser.add_argument("--parallel", action="store_true", help="Run engines in parallel (auto mode)")
     parser.add_argument("--sim", action="store_true", help="Run random simulation only")
     parser.add_argument("--fanin", action="store_true", help="Show fan-in cone analysis")
     parser.add_argument("--text", "-t", help="Inline SystemVerilog text")
@@ -82,6 +83,7 @@ endmodule
             timeout_per_engine=60000,
             max_bmc=args.max_bmc,
             max_kind=args.max_kind,
+            parallel=args.parallel,
         )
         print()
         print(format_orchestrator_results(results, verbose=args.verbose))

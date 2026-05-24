@@ -46,20 +46,25 @@ class EngineOrchestrator:
         self.verbose = verbose
         self._clause_cache = {}  # property_name -> list of inductive clauses
 
-    def verify_all(self, timeout_per_engine=60000, max_bmc=100, max_kind=10):
-        """Verify all properties across all types."""
+    def verify_all(self, timeout_per_engine=60000, max_bmc=100, max_kind=10,
+                   parallel=False):
+        """Verify all properties across all types.
+
+        If parallel=True, engines run concurrently within each property.
+        """
         results = {}
 
         for ptype in ["properties", "trans_properties", "cover_properties"]:
             prop_list = getattr(self.ts, ptype, [])
             for pname, p_expr in prop_list:
                 res = self._verify_one(pname, p_expr, ptype,
-                                       timeout_per_engine, max_bmc, max_kind)
+                                       timeout_per_engine, max_bmc, max_kind,
+                                       parallel=parallel)
                 results[pname] = res
 
         return results
 
-    def _verify_one(self, pname, p_expr, ptype, timeout, max_bmc, max_kind):
+    def _verify_one(self, pname, p_expr, ptype, timeout, max_bmc, max_kind, parallel=False):
         res = VerificationResult(pname, ptype)
 
         if ptype == "cover_properties":
@@ -88,73 +93,124 @@ class EngineOrchestrator:
                 print(f"  [{pname}] Simulation found CEX at depth {res.bound}")
             return res
 
-        # Analyze property structure to choose engine strategy
-        prop_type_analysis = self._analyze_property(p_expr, fanin_state)
+        # Phase 2: Run formal engines
+        if parallel:
+            return self._verify_parallel(pname, p_expr, ptype, timeout,
+                                          max_bmc, max_kind, res, start,
+                                          fanin_state)
 
-        # Phase 2: Run engines based on property analysis
-        if prop_type_analysis == "deep_state":
-            # Deep finite-state-machine: k-induction first, then IC3
-            strategy = ["kind", "bmc", "ic3"]
-        elif prop_type_analysis == "datapath":
-            # Datapath-heavy: BMC first (find deep bugs), then IC3
-            strategy = ["bmc", "ic3", "kind"]
-        elif prop_type_analysis == "control":
-            # Control-heavy: IC3 first (good at Boolean reasoning)
-            strategy = ["ic3", "bmc", "kind"]
-        else:
-            strategy = ["bmc", "ic3", "kind"]
+        return self._verify_sequential(pname, p_expr, ptype, timeout,
+                                        max_bmc, max_kind, res, start,
+                                        fanin_state)
+
+    def _verify_sequential(self, pname, p_expr, ptype, timeout,
+                            max_bmc, max_kind, res, start, fanin_state):
+        prop_type_analysis = self._analyze_property(p_expr, fanin_state)
+        strategy = self._select_strategy(prop_type_analysis)
 
         if self.verbose:
             print(f"  [{pname}] Property type: {prop_type_analysis}")
             print(f"  [{pname}] Strategy: {strategy}")
 
         for engine_name in strategy:
-            engine_start = time.time()
-            res.engines_tried.append(engine_name)
-            elapsed_budget = (timeout - (time.time() - start)) / 1000
-
-            if elapsed_budget <= 0:
-                break
-
-            if self.verbose:
-                print(f"  [{pname}] Engine: {engine_name}...")
-
-            if engine_name == "bmc":
-                engine_res = bmc_incremental(self.ts, max_bmc, verbose=self.verbose)
-            elif engine_name == "kind":
-                engine_res = check_kinduction(self.ts, max_kind, verbose=self.verbose)
-            elif engine_name == "ic3":
-                ic3 = IC3(self.ts)
-                engine_res = ic3.prove(verbose=self.verbose)
-            else:
-                continue
-
-            engine_elapsed = time.time() - engine_start
-
-            if engine_res.get("result") == "fail":
-                res.result = "fail"
-                res.engine = engine_name
-                res.bound = engine_res.get("bound")
-                res.counterexample = engine_res.get("counterexample")
-                res.trace = engine_res.get("trace")
-                res.time_taken = time.time() - start
-                if self.verbose:
-                    print(f"  [{pname}] {engine_name} found CEX at depth {res.bound}")
-                return res
-
-            if engine_res.get("result") == "proved":
-                res.result = "proved"
-                res.engine = engine_name
-                res.time_taken = time.time() - start
-                if self.verbose:
-                    print(f"  [{pname}] {engine_name} proved property")
-                return res
-
-            if self.verbose:
-                print(f"  [{pname}] {engine_name}: inconclusive")
+            engine_res = self._run_single_engine(engine_name, pname, timeout,
+                                                  max_bmc, max_kind, res, start)
+            if engine_res:
+                return engine_res
 
         res.time_taken = time.time() - start
         return res
+
+    def _verify_parallel(self, pname, p_expr, ptype, timeout,
+                          max_bmc, max_kind, res, start, fanin_state):
+        prop_type_analysis = self._analyze_property(p_expr, fanin_state)
+        strategy = self._select_strategy(prop_type_analysis)
+
+        if self.verbose:
+            print(f"  [{pname}] Property type: {prop_type_analysis}")
+            print(f"  [{pname}] Parallel strategy: {strategy}")
+
+        per_engine_timeout = max(5, timeout // len(strategy))
+
+        def run_engine(name):
+            local_res = VerificationResult(pname, ptype)
+            local_res.engines_tried = list(res.engines_tried)
+            return self._run_single_engine(name, pname, per_engine_timeout,
+                                            max_bmc, max_kind, local_res, time.time())
+
+        with ThreadPoolExecutor(max_workers=len(strategy)) as executor:
+            future_map = {
+                executor.submit(run_engine, name): name
+                for name in strategy
+            }
+            for future in as_completed(future_map):
+                engine_res = future.result()
+                if engine_res is not None:
+                    res.result = engine_res.result
+                    res.engine = engine_res.engine
+                    res.bound = engine_res.bound
+                    res.counterexample = engine_res.counterexample
+                    res.trace = engine_res.trace
+                    res.engines_tried = engine_res.engines_tried
+                    res.time_taken = time.time() - start
+                    return res
+
+        res.time_taken = time.time() - start
+        return res
+
+    def _select_strategy(self, prop_type):
+        if prop_type == "deep_state":
+            return ["kind", "bmc", "ic3"]
+        elif prop_type == "datapath":
+            return ["bmc", "ic3", "kind"]
+        elif prop_type == "control":
+            return ["ic3", "bmc", "kind"]
+        else:
+            return ["bmc", "ic3", "kind"]
+
+    def _run_single_engine(self, engine_name, pname, timeout,
+                            max_bmc, max_kind, res, start):
+        elapsed_budget = (timeout - (time.time() - start)) / 1000
+        if elapsed_budget <= 0:
+            return None
+
+        if self.verbose:
+            print(f"  [{pname}] Engine: {engine_name}...")
+
+        res.engines_tried.append(engine_name)
+
+        if engine_name == "bmc":
+            engine_res = bmc_incremental(self.ts, max_bmc, verbose=self.verbose)
+        elif engine_name == "kind":
+            engine_res = check_kinduction(self.ts, max_kind, verbose=self.verbose)
+        elif engine_name == "ic3":
+            ic3 = IC3(self.ts)
+            engine_res = ic3.prove(verbose=self.verbose)
+        else:
+            return None
+
+        if engine_res.get("result") == "fail":
+            res.result = "fail"
+            res.engine = engine_name
+            res.bound = engine_res.get("bound")
+            res.counterexample = engine_res.get("counterexample")
+            res.trace = engine_res.get("trace")
+            res.time_taken = time.time() - start
+            if self.verbose:
+                print(f"  [{pname}] {engine_name} found CEX at depth {res.bound}")
+            return res
+
+        if engine_res.get("result") == "proved":
+            res.result = "proved"
+            res.engine = engine_name
+            res.time_taken = time.time() - start
+            if self.verbose:
+                print(f"  [{pname}] {engine_name} proved property")
+            return res
+
+        if self.verbose:
+            print(f"  [{pname}] {engine_name}: inconclusive")
+        return None
 
     def verify_with_strategies(self, strategies, parallel=False):
         """Run multiple strategies, possibly in parallel. Return first conclusive result."""
