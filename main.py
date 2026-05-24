@@ -10,6 +10,7 @@ from fml.engine.ic3 import IC3
 from fml.engine.orchestrator import EngineOrchestrator, format_orchestrator_results
 from fml.engine.simulation import simulation_falsify
 from fml.engine.fan_in import compute_fanin_cone, summarize_cone
+from fml.engine.aiger import ts_verify_via_abc
 
 import z3
 
@@ -25,6 +26,7 @@ def main():
     parser.add_argument("--auto", action="store_true", help="Auto mode: orchestrator selects best strategy")
     parser.add_argument("--parallel", action="store_true", help="Run engines in parallel (auto mode)")
     parser.add_argument("--sim", action="store_true", help="Run random simulation only")
+    parser.add_argument("--abc", action="store_true", help="Run ABC PDR (yosys + ABC pipeline) only")
     parser.add_argument("--fanin", action="store_true", help="Show fan-in cone analysis")
     parser.add_argument("--text", "-t", help="Inline SystemVerilog text")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
@@ -76,6 +78,12 @@ endmodule
             print("  No counterexample found in simulation.")
         return
 
+    if args.abc:
+        print("\n>>> Running ABC PDR (yosys + ABC pipeline)...")
+        result = ts_verify_via_abc(sys)
+        _print_result(result)
+        return
+
     if args.auto:
         print("\n>>> Auto mode: orchestrating engines...")
         orch = EngineOrchestrator(sys, verbose=args.verbose)
@@ -105,7 +113,7 @@ endmodule
         result = ic3.prove(verbose=args.verbose)
         _print_result(result)
 
-    if args.bmc == 0 and args.kind == 0 and not args.ic3 and not args.auto:
+    if args.bmc == 0 and args.kind == 0 and not args.ic3 and not args.auto and not args.abc:
         print(sys.summarize())
 
 

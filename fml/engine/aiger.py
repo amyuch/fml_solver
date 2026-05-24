@@ -309,8 +309,14 @@ def ts_verify_via_abc(ts, yosys_bin="yosys", abc_bin="yosys-abc", timeout=60):
         # Parse ABC output — look for PDR result
         for line in output.split('\n'):
             if 'was asserted in frame' in line:
+                bound = None
+                for i, word in enumerate(line.split()):
+                    if word == 'frame' and i + 1 < len(line.split()):
+                        frame_word = line.split()[i + 1].rstrip('.')
+                        if frame_word.isdigit():
+                            bound = int(frame_word)
                 return {"result": "fail", "engine": "abc_pdr",
-                        "frame": line.strip()}
+                        "frame": bound if bound is not None else line.strip()}
             if 'The network was proved' in line or 'Property proved' in line:
                 return {"result": "proved", "engine": "abc_pdr"}
 

@@ -7,6 +7,7 @@ from .kind import check_kinduction
 from .ic3 import IC3
 from .simulation import simulation_falsify, simulation_cover
 from .fan_in import compute_fanin_cone, summarize_cone
+from .aiger import ts_verify_via_abc
 
 
 class VerificationResult:
@@ -160,13 +161,13 @@ class EngineOrchestrator:
 
     def _select_strategy(self, prop_type):
         if prop_type == "deep_state":
-            return ["kind", "bmc", "ic3"]
+            return ["kind", "abc", "bmc", "ic3"]
         elif prop_type == "datapath":
-            return ["bmc", "ic3", "kind"]
+            return ["abc", "bmc", "ic3", "kind"]
         elif prop_type == "control":
-            return ["ic3", "bmc", "kind"]
+            return ["ic3", "abc", "bmc", "kind"]
         else:
-            return ["bmc", "ic3", "kind"]
+            return ["abc", "bmc", "ic3", "kind"]
 
     def _run_single_engine(self, engine_name, pname, timeout,
                             max_bmc, max_kind, res, start):
@@ -186,13 +187,15 @@ class EngineOrchestrator:
         elif engine_name == "ic3":
             ic3 = IC3(self.ts)
             engine_res = ic3.prove(verbose=self.verbose)
+        elif engine_name == "abc":
+            engine_res = ts_verify_via_abc(self.ts, timeout=int(elapsed_budget))
         else:
             return None
 
         if engine_res.get("result") == "fail":
             res.result = "fail"
             res.engine = engine_name
-            res.bound = engine_res.get("bound")
+            res.bound = engine_res.get("bound") or engine_res.get("frame")
             res.counterexample = engine_res.get("counterexample")
             res.trace = engine_res.get("trace")
             res.time_taken = time.time() - start
@@ -253,6 +256,13 @@ class EngineOrchestrator:
                 res = ic3.prove(**params)
                 if res.get("result") in ("fail", "proved", "pass"):
                     return self._to_result(res, "ic3")
+            elif engine == "abc":
+                res = ts_verify_via_abc(self.ts, **params)
+                if res.get("result") in ("fail", "proved", "pass"):
+                    r = self._to_result(res, "abc")
+                    if res.get("frame"):
+                        r.bound = res.get("frame")
+                    return r
 
         return VerificationResult("all")
 
