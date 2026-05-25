@@ -242,10 +242,21 @@ class RTLParser:
                 self._process_parameter_declaration(member, ts)
             elif k == SyntaxKind.HierarchyInstantiation:
                 pass
-            elif k == SyntaxKind.ModuleInstantiation:
+
+            elif k == SyntaxKind.TypedefDeclaration:
+                pass
+            elif k == SyntaxKind.NetDeclaration:
+                self._process_data_declaration(member, ts)
+            elif k == SyntaxKind.PackageImportDeclaration:
+                pass
+            elif k == SyntaxKind.DPIImport:
+                pass
+            elif k == SyntaxKind.DefaultNetTypeDirective:
                 pass
             else:
-                warnings.warn(f"Unhandled module member: {k}", stacklevel=2)
+                k_str = str(k)
+                if 'Unused' not in k_str and 'Empty' not in k_str:
+                    warnings.warn(f"Unhandled module member: {k}", stacklevel=2)
 
     def _process_parameter_declaration(self, node, ts: TransitionSystem):
         if hasattr(node, 'parameter') and node.parameter is not None:
@@ -490,7 +501,12 @@ class RTLParser:
             w = 1
         signed = self._is_signed_type(node.type)
         for decl in node.declarators:
-            name = self._token_text(decl.name)
+            if not hasattr(decl, 'name'):
+                continue
+            try:
+                name = self._token_text(decl.name)
+            except Exception:
+                continue
             if name not in ts.state_vars and name not in ts.inputs:
                 ts.add_state_var(name, w, signed=signed)
 
@@ -768,6 +784,8 @@ class RTLParser:
 
         if hasattr(ps, 'expr') and ps.expr is not None:
             result = self._property_to_z3(ps.expr, clock, ts)
+            if result is not None and disable_expr is not None:
+                result = z3.Or(disable_expr, result)
             if result is not None:
                 if directive == "assume":
                     prefix = f"assume_{len(ts.assumptions)}"
@@ -800,12 +818,12 @@ class RTLParser:
                 ts.add_property(f"assert_{len(ts.properties)}", z3.Implies(ant, cons))
                 return None
 
-        if k == SyntaxKind.SimplePropertyExpr:
+        if k in (SyntaxKind.ParenthesizedPropertyExpr, SyntaxKind.SimplePropertyExpr, SyntaxKind.SimpleSequenceExpr):
             if hasattr(node, 'expr'):
                 return self._property_to_z3(node.expr, clock, ts)
             return None
 
-        if k == SyntaxKind.SimpleSequenceExpr:
+        if k == SyntaxKind.ClockingPropertyExpr:
             if hasattr(node, 'expr'):
                 return self._property_to_z3(node.expr, clock, ts)
             return None
@@ -921,9 +939,12 @@ class RTLParser:
                                 return result
                             result = z3.Extract(hi, lo, result)
                         else:
-                            base_z = _zext(result, w + selector.right.size())
+                            right_width = self._extract_width_from_node(selector.right)
+                            if right_width is None or right_width <= 0:
+                                right_width = 1
+                            base_z = _zext(result, w + right_width)
                             shift = _zext(left_val, w)
-                            result = z3.Extract(right_val.size() - 1, 0, z3.LShR(result, shift))
+                            result = z3.Extract(right_width - 1, 0, z3.LShR(result, shift))
 
                     elif sk == SyntaxKind.BitSelect:
                         idx = self._node_to_z3(selector.expr)
@@ -1147,6 +1168,32 @@ class RTLParser:
                     func_name = func_name[1:]
                 args = self._extract_call_args(node)
                 return self._process_system_func(func_name, args)
+            return z3.BitVecVal(0, 1)
+
+        if k == SyntaxKind.InsideExpression:
+            left = self._node_to_z3(node.expr)
+            ranges_node = node.ranges
+            elements = []
+            for child in ranges_node:
+                kind = child.kind
+                if kind in (TokenKind.OpenBrace, TokenKind.CloseBrace, TokenKind.Comma):
+                    continue
+                elements.append(child)
+            if not elements:
+                return z3.BitVecVal(0, 1)
+            range_vals = [self._node_to_z3(e) for e in elements]
+            return z3.If(
+                z3.Or(*[left == rv for rv in range_vals]),
+                z3.BitVecVal(1, 1),
+                z3.BitVecVal(0, 1)
+            )
+
+        if k == SyntaxKind.UnbasedUnsizedLiteralExpression:
+            txt = str(node)
+            if txt.strip() in ("'0", "'b0", "'B0"):
+                return z3.BitVecVal(0, 1)
+            if txt.strip() in ("'1", "'b1", "'B1"):
+                return z3.BitVecVal(1, 1)
             return z3.BitVecVal(0, 1)
 
         warnings.warn(f"Unhandled expression node: {k}", stacklevel=2)
