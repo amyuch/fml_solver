@@ -5,6 +5,7 @@ Architecture:
 - UNSAT: fast path (PySAT only, ~2x faster than Z3)
 - SAT: Z3 fallback for model extraction (rare in IC3)
 - Clause generalization: Z3's unsat-core extraction
+- BMC fallback: when IC3 blocks out, bounded model check finds CEX quickly
 """
 
 import z3
@@ -23,17 +24,18 @@ class SATIC3:
     """
 
     def __init__(self, ts: TransitionSystem, max_frames: int = 20,
-                 max_blocking: int = 3000):
+                 max_blocking: int = 20, bmc_fallback_depth: int = None):
         self.ts = ts
         self.max_frames = max_frames
         self.max_blocking = max_blocking
+        self.bmc_fallback_depth = bmc_fallback_depth or max_frames * 50
+        self._core_cache = {}
 
     def prove(self, verbose: bool = True) -> dict:
         ts = self.ts
         if not ts.properties and not ts.trans_properties:
             return {"result": "unknown", "reason": "no properties"}
 
-        # Regular (current-state) properties: IC3
         for pname, p_expr in ts.properties:
             result = self._prove_property(p_expr, pname, verbose)
             if result["result"] == "fail":
@@ -41,8 +43,6 @@ class SATIC3:
             if result["result"] == "unknown":
                 return {"result": "unknown", "reason": f"property {pname} unknown"}
 
-        # Transition properties (contain next-state vars): cannot use
-        # standard IC3 P_next substitution, fall back to proven path only
         if ts.trans_properties:
             from ..engine.kind import check_kinduction
             kind_result = check_kinduction(ts, self.max_frames, verbose=verbose)
@@ -55,12 +55,30 @@ class SATIC3:
             return {"result": "unknown"}
         return {"result": "proved", "bound": self.max_frames}
 
-    def _prove_property(self, P, pname, verbose):
-        ts = self.ts
+    def _build_core_cache(self, P, ts):
+        """Pre-compute invariant expressions used across all IC3 queries."""
+        key = (id(P), id(ts))
+        if key in self._core_cache:
+            return self._core_cache[key]
+
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
         P_next = z3.substitute(P, *cur_to_next)
+        ts_cn = z3.substitute(ts.comb_expr, *cur_to_next)
 
-        # Initial state check: I ∧ ¬P
+        cache = {
+            "cur_to_next": cur_to_next,
+            "P_next": P_next,
+            "ts_cn": ts_cn,
+        }
+        self._core_cache[key] = cache
+        return cache
+
+    def _prove_property(self, P, pname, verbose):
+        ts = self.ts
+        cc = self._build_core_cache(P, ts)
+        cur_to_next = cc["cur_to_next"]
+        P_next = cc["P_next"]
+
         if self._sat_check(z3.And([ts.init_expr, ts.assumption_expr, z3.Not(P)])):
             if verbose:
                 print(f"      counterexample at initial state")
@@ -72,17 +90,23 @@ class SATIC3:
         for k in range(1, self.max_frames + 1):
             if verbose:
                 print(f"    frame {k}")
-            ok = self._strengthen(k, F, P, P_next, ts, verbose)
+            ok = self._strengthen(k, F, P, P_next, ts, cc, verbose)
             if isinstance(ok, dict) and ok.get("result") == "fail":
                 return ok
             if ok == "proved":
                 return {"result": "proved", "property": pname, "k": k - 1}
             if ok is None:
+                bmc_depth = self.bmc_fallback_depth
                 if verbose:
-                    print(f"      blocking limit reached at frame {k}")
-                return {"result": "unknown", "property": pname, "reason": "blocking limit"}
+                    print(f"      max_blocking exhausted, running BMC fallback (depth={bmc_depth})...")
+                from ..engine.bmc import bmc_incremental
+                bmc_result = bmc_incremental(ts, bmc_depth, verbose=False)
+                if bmc_result["result"] == "fail":
+                    return bmc_result
+                return {"result": "unknown", "property": pname,
+                        "bound": self.max_frames, "bmc_checked_up_to": bmc_depth}
 
-            self._propagate(k, F, P, P_next, ts)
+            self._propagate(k, F, P, ts, cc)
             if self._frames_equal(F, k - 1, k) and len(F[k]) > 0:
                 if verbose:
                     print(f"      converged at frame {k}")
@@ -90,8 +114,8 @@ class SATIC3:
 
         return {"result": "unknown", "property": pname, "bound": self.max_frames}
 
-    def _strengthen(self, k, F, P, P_next, ts, verbose):
-        cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
+    def _strengthen(self, k, F, P, P_next, ts, cc, verbose):
+        cur_to_next = cc["cur_to_next"]
         heap = []
         seq = 0
 
@@ -106,10 +130,9 @@ class SATIC3:
             if heap:
                 i, _, cube = heappop(heap)
             else:
-                # No pending CTIs — query F[k-1] + T + ¬P_next for new CTIs
-                q = self._build_cti_query(k, F, P, P_next, ts, cur_to_next)
+                q = self._build_cti_query(k, F, P, P_next, ts, cc)
                 model = self._sat_check_with_model(q)
-                if model is None:  # UNSAT
+                if model is None:
                     if self._frames_equal(F, k - 1, k):
                         return "proved"
                     return True
@@ -126,12 +149,12 @@ class SATIC3:
             if self._is_blocked(cube, i, F):
                 continue
 
-            model = self._check_predecessor(cube, i, F, P, P_next, ts, cur_to_next)
-            if model is None:  # timeout
+            model = self._check_predecessor(cube, i, F, P, P_next, ts, cc)
+            if model is None:
                 continue
 
-            if model is False:  # UNSAT — cube is inductive relative to F[i-1]
-                clause = self._generalize(cube, i, F, P, P_next, ts, cur_to_next)
+            if model is False:
+                clause = self._generalize(cube, i, F, P, P_next, ts, cc)
                 self._add_clause(clause, i, F)
                 continue
 
@@ -140,34 +163,26 @@ class SATIC3:
                     print(f"      CEX: init reaches bad")
                 return {"result": "fail", "bound": 0}
 
-            # CTI has predecessor — push both cubes
             _push_cube(cube, i)
             pred_cube = self._extract_cube(model, ts)
             _push_cube(pred_cube, i - 1)
 
         return None
 
-    def _build_cti_query(self, k, F, P, P_next, ts, cur_to_next):
+    def _build_cti_query(self, k, F, P, P_next, ts, cc):
         """F[k-1] ∧ T ∧ comb ∧ ¬P_next"""
-        ts_cn = z3.substitute(ts.comb_expr, *cur_to_next)
         parts = [z3.And(*F[k - 1])]
         parts.append(P)
         parts.append(ts.assumption_expr)
         parts.append(ts.comb_expr)
         parts.append(ts.trans_expr)
-        parts.append(ts_cn)
+        parts.append(cc["ts_cn"])
         parts.append(z3.Not(P_next))
         return z3.And(*parts) if len(parts) > 1 else parts[0]
 
-    def _check_predecessor(self, cube, i, F, P, P_next, ts, cur_to_next):
-        """F[i-1] ∧ T ∧ comb_next ∧ cube_next — SAT? => predecessor exists.
-        Returns:
-          dict (model) if SAT
-          False if UNSAT (cube is inductive relative to F[i-1])
-          None if unknown/timeout
-        """
-        ts_cn = z3.substitute(ts.comb_expr, *cur_to_next)
-        cube_next = z3.substitute(cube, *cur_to_next)
+    def _check_predecessor(self, cube, i, F, P, P_next, ts, cc):
+        """F[i-1] ∧ T ∧ comb_next ∧ cube_next — SAT? => predecessor exists."""
+        cube_next = z3.substitute(cube, *cc["cur_to_next"])
         parts = []
         if i == 0:
             parts.append(ts.init_expr)
@@ -177,7 +192,7 @@ class SATIC3:
         parts.append(ts.assumption_expr)
         parts.append(ts.comb_expr)
         parts.append(ts.trans_expr)
-        parts.append(ts_cn)
+        parts.append(cc["ts_cn"])
         parts.append(cube_next)
         query = z3.And(*parts) if len(parts) > 1 else parts[0]
         sat = self._sat_check(query)
@@ -187,7 +202,7 @@ class SATIC3:
             return False
         return None
 
-    def _generalize(self, cube, i, F, P, P_next, ts, cur_to_next):
+    def _generalize(self, cube, i, F, P, P_next, ts, cc):
         """Generalize cube to clause via selective literal removal."""
         if i < 0:
             return z3.Not(cube)
@@ -197,14 +212,14 @@ class SATIC3:
             return z3.Not(cube)
 
         essential = list(lits)
-        ts_cn = z3.substitute(ts.comb_expr, *cur_to_next)
 
-        for idx in range(len(lits) - 1, -1, -1):
-            test_lits = [essential[j] for j in range(len(essential)) if j != idx]
+        for idx in range(len(essential) - 1, -1, -1):
+            lit = essential[idx]
+            test_lits = essential[:idx] + essential[idx+1:]
             if not test_lits:
                 continue
             test_cube = z3.And(*test_lits) if len(test_lits) > 1 else test_lits[0]
-            test_next = z3.substitute(test_cube, *cur_to_next)
+            test_next = z3.substitute(test_cube, *cc["cur_to_next"])
 
             parts = []
             if i == 0:
@@ -215,7 +230,7 @@ class SATIC3:
             parts.append(ts.assumption_expr)
             parts.append(ts.comb_expr)
             parts.append(ts.trans_expr)
-            parts.append(ts_cn)
+            parts.append(cc["ts_cn"])
             parts.append(test_next)
             query = z3.And(*parts) if len(parts) > 1 else parts[0]
 
@@ -294,10 +309,7 @@ class SATIC3:
             return False
         return set(str(c) for c in F[i]) == set(str(c) for c in F[j])
 
-    def _propagate(self, k, F, P, P_next, ts):
-        cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
-        ts_cn = z3.substitute(ts.comb_expr, *cur_to_next)
-
+    def _propagate(self, k, F, P, ts, cc):
         for fi in range(min(k, len(F) - 1)):
             frm = F[fi]
             frm_next = F[fi + 1]
@@ -306,16 +318,16 @@ class SATIC3:
                 continue
 
             for c in candidates:
-                cn = z3.substitute(z3.Not(c), *cur_to_next)
+                cn = z3.substitute(z3.Not(c), *cc["cur_to_next"])
                 parts = []
-                for cc in frm:
-                    parts.append(cc)
+                for cc_clause in frm:
+                    parts.append(cc_clause)
                 if fi >= 1:
                     parts.append(P)
                 parts.append(ts.assumption_expr)
                 parts.append(ts.comb_expr)
                 parts.append(ts.trans_expr)
-                parts.append(ts_cn)
+                parts.append(cc["ts_cn"])
                 parts.append(cn)
                 query = z3.And(*parts) if len(parts) > 1 else parts[0]
                 if not self._sat_check(query):
@@ -324,8 +336,10 @@ class SATIC3:
     def _sat_check(self, expr):
         """Check Z3 expr via PySAT. Returns True if SAT, False if UNSAT, None if unknown."""
         dimacs, n_vars, n_clauses = z3_to_dimacs(expr)
-        if n_vars == 0 and n_clauses == 0:
-            return False  # trivially UNSAT (empty clause = contradiction)
+        if n_vars == 0:
+            if n_clauses == 0:
+                return True
+            return False
         if not dimacs:
             return self._sat_check_z3(expr)
 
@@ -335,14 +349,19 @@ class SATIC3:
                 line = line.strip()
                 if not line or line.startswith('p ') or line.startswith('c'):
                     continue
-                clause = [int(x) for x in line.split() if x != '0']
-                if clause:
-                    solver.add_clause(clause)
+                lits = [int(x) for x in line.split()]
+                if lits and lits[-1] == 0:
+                    lits = lits[:-1]
+                if not lits:
+                    solver.add_clause([1])
+                    solver.add_clause([-1])
+                    break
+                solver.add_clause(lits)
             result = solver.solve()
             solver.delete()
             if result is None:
                 return None
-            return result  # True = SAT, False = UNSAT
+            return result
         except Exception:
             return self._sat_check_z3(expr)
 
