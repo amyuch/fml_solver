@@ -100,7 +100,6 @@ class TransitionSystem:
 
     def add_comb_constraint(self, expr: z3.BoolRef):
         self._comb_constraints.append(expr)
-        self._init_constraints.append(expr)
 
     @property
     def comb_expr(self) -> z3.BoolRef:

@@ -94,6 +94,28 @@ def _expand_assert(text, start):
     return f'{name}: assert property (@(posedge {clk}) disable iff (({rst}) !== \'0) ({prop}));', end + 1
 
 
+def _expand_assume(text, start):
+    """Expand `ASSUME(name, prop, clk, rst)"""
+    end = _find_matching_paren(text, start)
+    args = _split_macro_args(text[start+1:end])
+    name = args[0]
+    prop = args[1]
+    clk = args[2] if len(args) > 2 else DEFAULT_CLK
+    rst = args[3] if len(args) > 3 else DEFAULT_RST
+    return f'{name}: assume property (@(posedge {clk}) disable iff (({rst}) !== \'0) ({prop}));', end + 1
+
+
+def _expand_cover(text, start):
+    """Expand `COVER(name, prop, clk, rst)"""
+    end = _find_matching_paren(text, start)
+    args = _split_macro_args(text[start+1:end])
+    name = args[0]
+    prop = args[1]
+    clk = args[2] if len(args) > 2 else DEFAULT_CLK
+    rst = args[3] if len(args) > 3 else DEFAULT_RST
+    return f'{name}: cover property (@(posedge {clk}) disable iff (({rst}) !== \'0) ({prop}));', end + 1
+
+
 def _expand_assert_known_if(text, start):
     """`ASSERT_KNOWN_IF(name, sig, en, clk, rst) → drop"""
     end = _find_matching_paren(text, start)
@@ -168,6 +190,8 @@ HANDLERS = {
     'ASSERT_AT_RESET': _expand_assert_at_reset,
     'ASSERT_AT_RESET_AND_FINAL': _expand_assert_at_reset,
     'ASSERT_ERROR': _expand_assert_init,
+    'ASSUME': _expand_assume,
+    'COVER': _expand_cover,
 }
 
 
@@ -252,10 +276,10 @@ def preprocess(text: str) -> str:
     text = _strip_ifdef_blocks(text)
 
     # Remove `include and `define lines for prim_assert
-    text = re.sub(r'`include\s+["<]prim_assert[^>]*[>"]\s*\n?', '', text)
-    text = re.sub(r'`include\s+["<]prim_macros[^>]*[>"]\s*\n?', '', text)
-    text = re.sub(r'`include\s+["<]prim_assert_sec_cm[^>]*[>"]\s*\n?', '', text)
-    text = re.sub(r'`include\s+["<]prim_flop_macros[^>]*[>"]\s*\n?', '', text)
+    text = re.sub(r'`include\s+["<]prim_assert[^>]*?[>"]\s*\n?', '', text)
+    text = re.sub(r'`include\s+["<]prim_macros[^>]*?[>"]\s*\n?', '', text)
+    text = re.sub(r'`include\s+["<]prim_assert_sec_cm[^>]*?[>"]\s*\n?', '', text)
+    text = re.sub(r'`include\s+["<]prim_flop_macros[^>]*?[>"]\s*\n?', '', text)
 
     # Remove `define lines
     for kw in ['ASSERT', 'COVER', 'ASSUME', 'PRIM_STRINGIFY', 'ASSERT_ERROR',
