@@ -615,7 +615,9 @@ class RTLParser:
                 for t in all_targets:
                     if t in clause_dict:
                         prev = result.get(t, ts.get_next(t))
-                        new_result[t] = z3.If(cond, clause_dict[t], prev)
+                        cl_val = clause_dict[t]
+                        pv, cv = self._z3_promote_pair(prev, cl_val)
+                        new_result[t] = z3.If(cond, cv, pv)
                     else:
                         new_result[t] = result.get(t, ts.get_next(t))
                 result = new_result
@@ -716,33 +718,79 @@ class RTLParser:
         self._current_ts = ts
         self._comb_mode = True
         stmt = block.statement
-        if stmt.kind == SyntaxKind.SequentialBlockStatement:
-            for item in stmt.items:
-                self._process_comb_item(item, ts)
-        else:
-            self._process_comb_stmt(stmt, ts)
+        assignments = self._collect_comb_assignments(stmt, ts)
+        for target, expr in assignments.items():
+            cur = ts.get_cur(target)
+            cw = cur.size()
+            ew = expr.size()
+            if cw != ew:
+                if cw > ew:
+                    expr = z3.ZeroExt(cw - ew, expr)
+                else:
+                    expr = z3.Extract(cw - 1, 0, expr)
+            ts.add_comb_constraint(cur == expr)
         self._comb_mode = False
 
-    def _process_comb_item(self, stmt, ts):
+    def _collect_comb_assignments(self, stmt, ts, prior: dict = None) -> dict:
+        if prior is None:
+            prior = {}
         k = stmt.kind
         if k == SyntaxKind.ExpressionStatement:
-            self._process_expr_stmt(stmt, ts)
-        elif k == SyntaxKind.ConditionalStatement:
-            result = self._stmt_next_conditional(stmt, ts)
-            for target, expr in result.items():
-                ts.add_comb_constraint(ts.get_cur(target) == expr)
-        elif k == SyntaxKind.SequentialBlockStatement:
+            result = {}
+            expr = stmt.expr
+            if expr.kind == SyntaxKind.AssignmentExpression:
+                lname = self._extract_name(expr.left)
+                if lname is not None:
+                    if lname not in ts.state_vars and lname not in ts.inputs:
+                        w = self._expr_width(expr.right, ts)
+                        ts.add_state_var(lname, w)
+                    result[lname] = self._node_to_z3(expr.right)
+            return result
+        if k in (SyntaxKind.ConditionalStatement,):
+            return self._stmt_next_conditional(stmt, ts)
+        if k == SyntaxKind.CaseStatement:
+            return self._collect_case_assignments(stmt, ts, prior)
+        if k == SyntaxKind.SequentialBlockStatement:
+            result = dict(prior)
             for item in stmt.items:
-                self._process_comb_item(item, ts)
+                item_assignments = self._collect_comb_assignments(item, ts, result)
+                result.update(item_assignments)
+            return result
+        return {}
 
-    def _process_comb_stmt(self, stmt, ts):
-        k = stmt.kind
-        if k == SyntaxKind.ConditionalStatement:
-            result = self._stmt_next_conditional(stmt, ts)
-            for target, expr in result.items():
-                ts.add_comb_constraint(ts.get_cur(target) == expr)
-        elif k == SyntaxKind.ExpressionStatement:
-            self._process_expr_stmt(stmt, ts)
+    def _collect_case_assignments(self, stmt, ts, prior: dict = None) -> dict:
+        """Process a case statement within always_comb, using prior as fallback defaults."""
+        if prior is None:
+            prior = {}
+        case_expr = self._node_to_z3(stmt.expr)
+        items = list(stmt.items)
+
+        result = {}
+        for item in reversed(items):
+            if item.kind == SyntaxKind.DefaultCaseItem:
+                result = self._extract_clause_assignments(item.clause, ts)
+            elif item.kind == SyntaxKind.StandardCaseItem:
+                match_vals = [self._node_to_z3(e) for e in item.expressions]
+                clause_dict = self._extract_clause_assignments(item.clause, ts)
+                cond = z3.Or(*[case_expr == mv for mv in match_vals]) if len(match_vals) > 1 else (case_expr == match_vals[0])
+                new_result = {}
+                all_targets = set(result.keys()) | set(clause_dict.keys())
+                for t in all_targets:
+                    if t in clause_dict:
+                        prev = result.get(t)
+                        if prev is None:
+                            prev = prior.get(t, ts.get_next(t))
+                        cl_val = clause_dict[t]
+                        pv, cv = self._z3_promote_pair(prev, cl_val)
+                        new_result[t] = z3.If(cond, cv, pv)
+                    else:
+                        val = result.get(t)
+                        if val is None:
+                            val = prior.get(t, ts.get_next(t))
+                        if val is not None:
+                            new_result[t] = val
+                result = new_result
+        return result
 
     def _process_cont_assign(self, assign, ts: TransitionSystem):
         self._current_ts = ts
@@ -1131,15 +1179,19 @@ class RTLParser:
             return self._node_to_z3(node.expression)
 
         if k == SyntaxKind.ConcatenationExpression:
-            parts = [self._node_to_z3(op) for op in node.operands]
+            parts = []
+            for child in node.expressions:
+                if hasattr(child, 'kind') and 'Token' in str(type(child).__name__):
+                    continue
+                parts.append(self._node_to_z3(child))
             result = parts[0] if parts else z3.BitVecVal(0, 1)
             for p in parts[1:]:
                 result = z3.Concat(result, p)
             return result
 
         if k == SyntaxKind.MultipleConcatenationExpression:
-            count_node = node.count
-            operand = self._node_to_z3(node.operand)
+            count_node = node.expression
+            operand = self._node_to_z3(node.concatenation)
             cnt = self._eval_literal(count_node)
             if cnt is not None and cnt > 0:
                 parts = [operand] * cnt
