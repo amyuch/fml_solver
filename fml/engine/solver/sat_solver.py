@@ -126,7 +126,7 @@ class SATBridge:
         Returns True if property fails at k (CEX found).
         """
         from .solver import unfold_transition_system
-        from ..ir.transition_system import TransitionSystem
+        from ...ir.transition_system import TransitionSystem
 
         state_snaps, input_snaps, solver = unfold_transition_system(ts, k)
 

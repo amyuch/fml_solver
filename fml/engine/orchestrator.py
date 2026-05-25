@@ -6,8 +6,8 @@ from .bmc import bmc_incremental
 from .kind import check_kinduction
 from .ic3 import IC3
 from .simulation import simulation_falsify, simulation_cover
-from .fan_in import compute_fanin_cone, summarize_cone
-from .aiger import ts_verify_via_abc
+from .analysis.fan_in import compute_fanin_cone, summarize_cone
+from .solver.abc_bridge import ts_verify_via_abc
 from .cover import cover_bmc
 
 

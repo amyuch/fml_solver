@@ -1,6 +1,6 @@
 import z3
 from pysat.solvers import Solver as SATSolver
-from ..ir.transition_system import TransitionSystem
+from ...ir.transition_system import TransitionSystem
 
 
 _blast = z3.Then('simplify', 'bit-blast', 'tseitin-cnf')

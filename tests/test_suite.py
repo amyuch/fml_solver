@@ -1,5 +1,5 @@
 import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from fml.parser.rtl_parser import RTLParser
 from fml.engine.bmc import bmc_incremental
 from fml.engine.kind import check_kinduction

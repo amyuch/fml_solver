@@ -1,5 +1,5 @@
 import z3
-from ..ir.transition_system import TransitionSystem
+from ...ir.transition_system import TransitionSystem
 
 
 def _collect_var_refs(expr, ts):

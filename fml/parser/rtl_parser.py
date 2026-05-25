@@ -784,8 +784,6 @@ class RTLParser:
 
         if hasattr(ps, 'expr') and ps.expr is not None:
             result = self._property_to_z3(ps.expr, clock, ts)
-            if result is not None and disable_expr is not None:
-                result = z3.Or(disable_expr, result)
             if result is not None:
                 if directive == "assume":
                     prefix = f"assume_{len(ts.assumptions)}"

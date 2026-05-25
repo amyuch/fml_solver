@@ -2,7 +2,7 @@ import os
 import subprocess
 import tempfile
 import z3
-from ..ir.transition_system import TransitionSystem
+from ...ir.transition_system import TransitionSystem
 
 
 def ts_to_verilog(ts, module_name="top"):

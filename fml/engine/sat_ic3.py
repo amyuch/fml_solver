@@ -12,7 +12,7 @@ import z3
 from heapq import heappush, heappop
 from pysat.solvers import Solver as SATSolver
 from ..ir.transition_system import TransitionSystem
-from ..engine.sat_solver import z3_to_dimacs
+from ..engine.solver.sat_solver import z3_to_dimacs
 
 
 class SATIC3:

@@ -1,16 +1,14 @@
 import sys
 import os
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 from fml.parser.rtl_parser import RTLParser
 from fml.engine.bmc import bmc_incremental
 from fml.engine.kind import check_kinduction
 from fml.engine.ic3 import IC3
 from fml.engine.orchestrator import EngineOrchestrator, format_orchestrator_results
 from fml.engine.simulation import simulation_falsify
-from fml.engine.fan_in import compute_fanin_cone, summarize_cone
-from fml.engine.aiger import ts_verify_via_abc
+from fml.engine.analysis.fan_in import compute_fanin_cone, summarize_cone
+from fml.engine.solver.abc_bridge import ts_verify_via_abc
 from fml.engine.cover import cover_bmc
 
 import z3
@@ -154,15 +152,15 @@ def _run_on_file(filepath: str, args) -> object:
 def _print_result(result: dict):
     res = result.get("result", "unknown")
     if res == "fail":
-        print(f"  ✗ {result.get('property', '?')}: FAILED")
+        print(f"  X {result.get('property', '?')}: FAILED")
         print(f"    Counterexample at bound {result.get('bound', '?')}")
         trace = result.get("trace", "")
         if trace:
             print(trace)
     elif res == "proved":
-        print(f"  ✓ {result.get('property', '?')}: PROVED")
+        print(f"  V {result.get('property', '?')}: PROVED")
     elif res == "pass":
-        print(f"  ✓ All properties: PASS up to bound {result.get('bound', '?')}")
+        print(f"  V All properties: PASS up to bound {result.get('bound', '?')}")
     else:
         print(f"  ? {result.get('property', '?')}: {result.get('reason', 'unknown')}")
 

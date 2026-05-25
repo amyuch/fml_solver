@@ -13,4 +13,7 @@ dependencies = [
 ]
 
 [project.scripts]
-fml = "fml.main:main"
+fml = "fml.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["fml*"]

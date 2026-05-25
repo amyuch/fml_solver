@@ -1,6 +1,6 @@
 import z3
 from typing import Optional, Any
-from ..ir.transition_system import TransitionSystem
+from ...ir.transition_system import TransitionSystem
 
 
 class SolverContext:

@@ -4,3 +4,6 @@ __pycache__/
 conda_env.yaml
 opencode.txt
 trace_script.py
+AGENTS.md
+benchmarks/
+.history/
