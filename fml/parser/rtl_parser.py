@@ -85,7 +85,7 @@ class RTLParser:
     def _process_param_decl(self, node, ts: TransitionSystem, width_override: int = None):
         w = width_override
         if w is None and hasattr(node, 'type') and node.type is not None:
-            w = self._extract_width_from_node(node.type)
+            w = self._extract_width_from_node(node.type, ts)
         if w is None or w <= 0:
             w = 1
         for decl in node.declarators:
@@ -185,22 +185,41 @@ class RTLParser:
 
         return (name, direction, width)
 
-    def _extract_width_from_node(self, node) -> int | None:
+    def _extract_width_from_node(self, node, ts: TransitionSystem = None) -> int | None:
         if node.kind == SyntaxKind.ImplicitType:
             if hasattr(node, 'dimensions') and node.dimensions:
                 for dim in node.dimensions:
-                    w = self._dimension_width(dim)
+                    w = self._dimension_width(dim, ts)
+                    if w is not None and w > 1:
+                        return w
+            return None
+        if node.kind == SyntaxKind.NamedType:
+            type_name = None
+            for child in node:
+                if hasattr(child, 'kind'):
+                    if child.kind == SyntaxKind.IdentifierName:
+                        type_name = str(child).strip()
+                    elif child.kind == SyntaxKind.IdentifierSelectName:
+                        type_name = self._token_text(child.identifier).strip()
+            if type_name and ts and type_name in ts.params and ts.params[type_name][0] == 'type_width':
+                bw = ts.params[type_name][1]
+                return bw
+            if hasattr(node, 'dimensions') and node.dimensions:
+                for dim in node.dimensions:
+                    w = self._dimension_width(dim, ts)
                     if w is not None and w > 1:
                         return w
             return None
         if hasattr(node, 'dimensions') and node.dimensions:
             for dim in node.dimensions:
-                w = self._dimension_width(dim)
+                w = self._dimension_width(dim, ts)
                 if w is not None and w > 1:
                     return w
         return None
 
-    def _dimension_width(self, dim) -> int:
+    def _dimension_width(self, dim, ts: TransitionSystem = None) -> int:
+        if ts is None:
+            ts = getattr(self, '_current_ts', None)
         if not hasattr(dim, 'specifier'):
             return 1
         spec = dim.specifier
@@ -208,8 +227,8 @@ class RTLParser:
             return 1
         sel = spec.selector
         if hasattr(sel, 'left') and hasattr(sel, 'right'):
-            lo = self._eval_literal(sel.left)
-            ro = self._eval_literal(sel.right)
+            lo = self._eval_literal_expr(sel.left, ts)
+            ro = self._eval_literal_expr(sel.right, ts)
             if lo is not None and ro is not None:
                 return abs(lo - ro) + 1
         return 1
@@ -226,6 +245,7 @@ class RTLParser:
         return None
 
     def _extract_body(self, mod_node, ts: TransitionSystem):
+        self._current_ts = ts
         for member in mod_node.members:
             k = member.kind
 
@@ -259,7 +279,7 @@ class RTLParser:
                 pass
 
             elif k == SyntaxKind.TypedefDeclaration:
-                pass
+                self._process_typedef(member, ts)
             elif k == SyntaxKind.NetDeclaration:
                 self._process_data_declaration(member, ts)
             elif k == SyntaxKind.PackageImportDeclaration:
@@ -511,10 +531,14 @@ class RTLParser:
         return None
 
     def _process_data_declaration(self, node, ts: TransitionSystem):
-        w = self._extract_width_from_node(node.type)
+        w = self._extract_width_from_node(node.type, ts)
         if w is None or w <= 0:
             w = 1
         signed = self._is_signed_type(node.type)
+        array_dims = self._extract_array_dims(node.type, ts)
+        # Multiply base width by array dimensions for total packed width
+        for d in array_dims:
+            w *= d
         for decl in node.declarators:
             if not hasattr(decl, 'name'):
                 continue
@@ -524,6 +548,81 @@ class RTLParser:
                 continue
             if name not in ts.state_vars and name not in ts.inputs:
                 ts.add_state_var(name, w, signed=signed)
+            if array_dims:
+                ts.set_var_dims(name, array_dims)
+
+    def _extract_array_dims(self, type_node, ts) -> list[int]:
+        dims = []
+        for child in type_node:
+            if hasattr(child, 'kind'):
+                if child.kind == SyntaxKind.IdentifierSelectName:
+                    for sel in child.selectors if hasattr(child, 'selectors') else []:
+                        if sel.kind == SyntaxKind.ElementSelect:
+                            s = sel.selector
+                            if s.kind == SyntaxKind.SimpleRangeSelect:
+                                lv = self._eval_literal_expr(s.left, ts)
+                                rv = self._eval_literal_expr(s.right, ts)
+                                if lv is not None and rv is not None:
+                                    dims.append(abs(lv - rv) + 1)
+        # Only extract from NamedType's IdentifierSelectName, not from base types
+        return dims
+
+    def _process_typedef(self, node, ts: TransitionSystem):
+        """Track typedef widths for struct types."""
+        type_name = None
+        struct_node = None
+        for child in node:
+            if hasattr(child, 'kind'):
+                k_str = str(child.kind)
+                if 'Identifier' in k_str and 'Token' in k_str:
+                    type_name = str(child).strip()
+                if child.kind == SyntaxKind.StructType:
+                    struct_node = child
+        if type_name and struct_node:
+            w = self._compute_struct_width(struct_node, ts)
+            if w > 0:
+                ts.params[type_name] = ('type_width', w)
+
+    def _compute_struct_width(self, node, ts) -> int:
+        total = 0
+        for child in node:
+            if child.kind == SyntaxKind.StructUnionMember:
+                fw = 0
+                for c2 in child:
+                    if c2.kind == SyntaxKind.LogicType:
+                        fw = self._extract_width_from_node(c2, ts) or 1
+                    elif c2.kind == SyntaxKind.NamedType:
+                        fw = self._signal_width(str(c2).strip(), ts) or 1
+                    elif c2.kind == SyntaxKind.StructType:
+                        fw = self._compute_struct_width(c2, ts) or 1
+                total += fw
+        return total
+        """Extract array dimension sizes from a type node."""
+        dims = []
+        for child in type_node:
+            if hasattr(child, 'kind'):
+                if child.kind == SyntaxKind.IdentifierSelectName:
+                    for sel in child.selectors if hasattr(child, 'selectors') else []:
+                        if sel.kind == SyntaxKind.ElementSelect:
+                            s = sel.selector
+                            if s.kind == SyntaxKind.SimpleRangeSelect:
+                                lv = self._eval_literal_expr(s.left, ts)
+                                rv = self._eval_literal_expr(s.right, ts)
+                                if lv is not None and rv is not None:
+                                    dims.append(abs(lv - rv) + 1)
+        # Also check for VariableDimension children on the type
+        if hasattr(type_node, 'dimensions'):
+            for dim in type_node.dimensions:
+                if dim.kind == SyntaxKind.VariableDimension:
+                    for child in dim:
+                        if hasattr(child, 'kind') and child.kind == SyntaxKind.RangeDimensionSpecifier:
+                            for c2 in child:
+                                if c2.kind == SyntaxKind.SimpleRangeSelect:
+                                    lv = self._eval_literal_expr(c2.left, ts)
+                                    rv = self._eval_literal_expr(c2.right, ts)
+                                    if lv is not None and rv is not None:
+                                        dims.append(abs(lv - rv) + 1)
+        return dims
 
     def _signal_width(self, name: str, ts: TransitionSystem) -> int:
         if name in ts.state_vars:
@@ -865,7 +964,15 @@ class RTLParser:
                     w = self._expr_width(right, ts)
                     ts.add_state_var(lname, w)
                 r_expr = self._node_to_z3(right)
-                ts.add_comb_constraint(ts.get_cur(lname) == r_expr)
+                cur = ts.get_cur(lname)
+                cw = cur.size()
+                ew = r_expr.size()
+                if cw != ew:
+                    if cw > ew:
+                        r_expr = z3.ZeroExt(cw - ew, r_expr)
+                    else:
+                        r_expr = z3.Extract(cw - 1, 0, r_expr)
+                ts.add_comb_constraint(cur == r_expr)
 
     def _process_assertion(self, stmt, ts: TransitionSystem,
                            directive: str | None = None):
@@ -1033,6 +1140,8 @@ class RTLParser:
                 return expr
 
             result = base
+            array_dims = self._current_ts.get_var_dims(name) if hasattr(self._current_ts, 'get_var_dims') else []
+            dim_idx = 0
             for sel in node.selectors:
                 if sel.kind == SyntaxKind.ElementSelect:
                     selector = sel.selector
@@ -1060,12 +1169,23 @@ class RTLParser:
 
                     elif sk == SyntaxKind.BitSelect:
                         idx = self._node_to_z3(selector.expr)
-                        if z3.is_bv_value(idx):
-                            bit = idx.as_long()
-                            result = z3.Extract(bit, bit, result)
+                        if dim_idx < len(array_dims):
+                            ew = result.size() // array_dims[dim_idx]
+                            if z3.is_bv_value(idx):
+                                bit = idx.as_long()
+                                offset = bit * ew
+                                result = z3.Extract(offset + ew - 1, offset, result)
+                            else:
+                                shift = _zext(idx, result.size())
+                                result = z3.Extract(ew - 1, 0, z3.LShR(result, shift * ew))
+                            dim_idx += 1
                         else:
-                            shift = _zext(idx, w)
-                            result = z3.Extract(0, 0, z3.LShR(result, shift))
+                            if z3.is_bv_value(idx):
+                                bit = idx.as_long()
+                                result = z3.Extract(bit, bit, result)
+                            else:
+                                shift = _zext(idx, w)
+                                result = z3.Extract(0, 0, z3.LShR(result, shift))
 
                     elif sk == SyntaxKind.AscendingRangeSelect:
                         base_expr = self._node_to_z3(selector.left)
@@ -1311,6 +1431,9 @@ class RTLParser:
             if txt.strip() in ("'1", "'b1", "'B1"):
                 return z3.BitVecVal(1, 1)
             return z3.BitVecVal(0, 1)
+
+        if k == SyntaxKind.ScopedName:
+            return self._node_to_z3(list(node)[0])
 
         warnings.warn(f"Unhandled expression node: {k}", stacklevel=2)
         return z3.BitVecVal(0, 1)

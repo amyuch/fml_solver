@@ -31,6 +31,7 @@ class TransitionSystem:
         self.assumptions: list[z3.BoolRef] = []
         self._comb_constraints: list[z3.BoolRef] = []
         self._next_state_exprs: dict[str, z3.BitVec] = {}
+        self._var_dims: dict[str, list[int]] = {}  # var_name -> [dim_size, ...]
 
     def add_state_var(self, name: str, width: int, init_val: int = 0, signed: bool = False):
         sv = StateVar(name, width, init_val)
@@ -52,6 +53,25 @@ class TransitionSystem:
 
     def set_next_state(self, name: str, expr: z3.BitVecRef):
         self._next_state_exprs[name] = expr
+
+    def set_var_dims(self, name: str, dims: list[int]):
+        self._var_dims[name] = dims
+
+    def get_var_dims(self, name: str) -> list[int]:
+        return self._var_dims.get(name, [])
+
+    def get_elem_width(self, name: str) -> int:
+        """Compute element width for array variables."""
+        dims = self._var_dims.get(name, [])
+        if not dims:
+            return 0
+        total = self.state_vars[name].width if name in self.state_vars else 1
+        dim_product = 1
+        for d in dims:
+            dim_product *= d
+        if dim_product > 0:
+            return total // dim_product
+        return 1
 
     def add_init(self, expr: z3.BoolRef):
         self._init_constraints.append(expr)
