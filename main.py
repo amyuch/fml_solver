@@ -11,6 +11,7 @@ from fml.engine.orchestrator import EngineOrchestrator, format_orchestrator_resu
 from fml.engine.simulation import simulation_falsify
 from fml.engine.fan_in import compute_fanin_cone, summarize_cone
 from fml.engine.aiger import ts_verify_via_abc
+from fml.engine.cover import cover_bmc
 
 import z3
 
@@ -27,6 +28,7 @@ def main():
     parser.add_argument("--parallel", action="store_true", help="Run engines in parallel (auto mode)")
     parser.add_argument("--sim", action="store_true", help="Run random simulation only")
     parser.add_argument("--abc", action="store_true", help="Run ABC PDR (yosys + ABC pipeline) only")
+    parser.add_argument("--cover", action="store_true", help="Run cover property analysis")
     parser.add_argument("--fanin", action="store_true", help="Show fan-in cone analysis")
     parser.add_argument("--text", "-t", help="Inline SystemVerilog text")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
@@ -84,6 +86,20 @@ endmodule
         _print_result(result)
         return
 
+    if args.cover:
+        print("\n>>> Running cover property analysis...")
+        results = cover_bmc(sys, max_cycles=500, verbose=args.verbose)
+        if results:
+            for r in results:
+                if r.get("result") == "reachable":
+                    print(f"  R {r['property']}: REACHABLE at depth {r.get('bound', '?')}")
+                    print(r.get("trace", ""))
+                else:
+                    print(f"  ? {r['property']}: {r.get('reason', 'unreachable')}")
+        else:
+            print("  No cover properties found.")
+        return
+
     if args.auto:
         print("\n>>> Auto mode: orchestrating engines...")
         orch = EngineOrchestrator(sys, verbose=args.verbose)
@@ -113,7 +129,7 @@ endmodule
         result = ic3.prove(verbose=args.verbose)
         _print_result(result)
 
-    if args.bmc == 0 and args.kind == 0 and not args.ic3 and not args.auto and not args.abc:
+    if args.bmc == 0 and args.kind == 0 and not args.ic3 and not args.auto and not args.abc and not args.cover:
         print(sys.summarize())
 
 

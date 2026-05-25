@@ -8,6 +8,7 @@ from .ic3 import IC3
 from .simulation import simulation_falsify, simulation_cover
 from .fan_in import compute_fanin_cone, summarize_cone
 from .aiger import ts_verify_via_abc
+from .cover import cover_bmc
 
 
 class VerificationResult:
@@ -306,9 +307,9 @@ class EngineOrchestrator:
 
     def _handle_cover(self, pname, p_expr, res):
         start = time.time()
-        cres = simulation_cover(self.ts, max_cycles=200, trials=3, verbose=self.verbose)
-        res.time_taken = time.time() - start
 
+        # Phase 1: Random simulation (fast)
+        cres = simulation_cover(self.ts, max_cycles=200, trials=3, verbose=self.verbose)
         if cres:
             for r in cres:
                 if r.get("result") == "reachable" and r.get("property") == pname:
@@ -317,11 +318,28 @@ class EngineOrchestrator:
                     res.bound = r.get("bound")
                     res.counterexample = r.get("counterexample")
                     res.trace = r.get("trace")
+                    res.time_taken = time.time() - start
                     return res
 
+        # Phase 2: BMC-based cover (exhaustive)
+        if self.verbose:
+            print(f"  [{pname}] Simulation missed cover, trying BMC cover...")
+        bres = cover_bmc(self.ts, max_cycles=500, verbose=self.verbose)
+        if bres:
+            for r in bres:
+                if r.get("result") == "reachable" and r.get("property") == pname:
+                    res.result = "reachable"
+                    res.engine = "cover_bmc"
+                    res.bound = r.get("bound")
+                    res.counterexample = r.get("counterexample")
+                    res.trace = r.get("trace")
+                    res.time_taken = time.time() - start
+                    return res
+
+        res.time_taken = time.time() - start
         res.result = "unknown"
-        res.engine = "simulation"
-        res.reason = "cover_target not reached in simulation"
+        res.engine = "cover_bmc"
+        res.reason = "cover_target not reached"
         return res
 
     def _to_result(self, raw, engine_name):
