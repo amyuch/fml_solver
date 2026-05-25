@@ -190,7 +190,14 @@ def _extract_from_node(node, known_types: dict, filepath: str):
                 type_name = _get_typedef_name(node)
                 if type_name:
                     w = _resolve_type_width(child, known_types)
-                    known_types[type_name] = w
+                    if isinstance(known_types.get(type_name), StructType):
+                        pass  # Don't overwrite struct types
+                    else:
+                        known_types[type_name] = w
+
+    # Extract parameters (localparam, parameter)
+    if hasattr(node, 'kind') and node.kind == SyntaxKind.ParameterDeclarationStatement:
+        _extract_parameter(node, known_types)
 
     if hasattr(node, 'members'):
         for m in node.members:
@@ -282,6 +289,31 @@ def _parse_struct_type(node, known_types: dict, type_name: str) -> StructType | 
         running += fwidth
 
     return StructType(type_name, total_width, fields)
+
+
+def _extract_parameter(node, known_types: dict):
+    """Extract parameter/localparam values from a ParameterDeclarationStatement."""
+    for child in node:
+        if hasattr(child, 'kind') and child.kind == SyntaxKind.ParameterDeclaration:
+            for decl in child:
+                if hasattr(decl, 'kind') and decl.kind == SyntaxKind.Declarator:
+                    param_name = None
+                    param_val = None
+                    for c2 in decl:
+                        if hasattr(c2, 'kind'):
+                            k_str = str(c2.kind)
+                            if 'Identifier' in k_str and 'Token' in k_str:
+                                param_name = str(c2).strip()
+                            elif c2.kind == SyntaxKind.EqualsValueClause:
+                                for c3 in c2:
+                                    if hasattr(c3, 'kind'):
+                                        if c3.kind == SyntaxKind.IntegerLiteralExpression:
+                                            try:
+                                                param_val = int(str(c3), 0)
+                                            except ValueError:
+                                                pass
+                    if param_name and param_val is not None:
+                        known_types[param_name] = param_val
 
 
 def _resolve_member_type(node, known_types: dict) -> tuple[int, dict]:

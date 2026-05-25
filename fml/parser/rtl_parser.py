@@ -1,4 +1,5 @@
 import z3
+import os
 import warnings
 from pyslang.driver import Driver
 from pyslang.syntax import SyntaxKind
@@ -33,6 +34,7 @@ class RTLParser:
         self._past_counter = 0
 
     def parse_file(self, filepath: str) -> list[TransitionSystem]:
+        self._module_path = filepath
         self.driver.parseCommandLine(f"parse {filepath}")
         self.driver.processOptions()
         ok = self.driver.parseAllSources()
@@ -70,6 +72,7 @@ class RTLParser:
         ts = TransitionSystem(mod_name)
         self._extract_header_params(header, ts)
         self._extract_ports(header, ts)
+        self._resolve_header_imports(header, ts)
         self._extract_body(mod_node, ts)
         return ts
 
@@ -92,6 +95,12 @@ class RTLParser:
                 init_val = self._eval_literal_expr(decl.initializer.expr, ts)
             if name not in ts.params:
                 ts.add_param(name, w, init_val)
+
+    def _resolve_header_imports(self, header, ts: TransitionSystem):
+        """Resolve package imports from the module header and inject params."""
+        for child in header:
+            if hasattr(child, 'kind') and child.kind == SyntaxKind.PackageImportDeclaration:
+                self._resolve_package_import(child, ts)
 
     def _is_signed_expr(self, node) -> bool:
         ts = getattr(self, '_current_ts', None)
@@ -236,6 +245,12 @@ class RTLParser:
                 self._process_data_declaration(member, ts)
             elif k == SyntaxKind.GenerateRegion:
                 self._process_generate_region(member, ts)
+            elif k == SyntaxKind.LoopGenerate:
+                self._process_loop_generate(member, ts)
+            elif k == SyntaxKind.IfGenerate:
+                self._process_if_generate(member, ts)
+            elif k == SyntaxKind.CaseGenerate:
+                self._process_case_generate(member, ts)
             elif k == SyntaxKind.GenvarDeclaration:
                 pass
             elif k == SyntaxKind.ParameterDeclarationStatement:
@@ -248,7 +263,7 @@ class RTLParser:
             elif k == SyntaxKind.NetDeclaration:
                 self._process_data_declaration(member, ts)
             elif k == SyntaxKind.PackageImportDeclaration:
-                pass
+                self._resolve_package_import(member, ts)
             elif k == SyntaxKind.DPIImport:
                 pass
             elif k == SyntaxKind.DefaultNetTypeDirective:
@@ -534,6 +549,51 @@ class RTLParser:
                 self._process_statement(item, ts)
         else:
             self._process_statement(body, ts)
+
+    def _resolve_package_import(self, node, ts: TransitionSystem):
+        """Resolve a package import and inject parameters into ts."""
+        try:
+            import_name = None
+            for child in node:
+                if hasattr(child, 'kind'):
+                    k_str = str(child.kind)
+                    if 'PackageImportItem' in k_str:
+                        for c2 in child:
+                            if hasattr(c2, 'kind'):
+                                ck = str(c2.kind)
+                                if 'Identifier' in ck and 'Token' in ck:
+                                    import_name = str(c2).strip()
+                                    break
+                    if 'Identifier' in k_str and 'Token' in k_str and 'Keyword' not in k_str:
+                        import_name = str(child).strip()
+
+            if not import_name:
+                return
+
+            search_paths = []
+            if self._module_path:
+                search_paths.append(os.path.dirname(self._module_path))
+                # Try OpenTitan standard paths
+                if '/opentitan/' in self._module_path:
+                    idx = self._module_path.index('/opentitan/')
+                    ot = self._module_path[:idx + len('/opentitan/')]
+                    search_paths.append(os.path.join(ot, 'hw', 'ip', 'prim', 'rtl'))
+                    # Try to find the package file in typical locations
+                    for ip_dir in os.listdir(os.path.join(ot, 'hw', 'ip')):
+                        pkg_path = os.path.join(ot, 'hw', 'ip', ip_dir, 'rtl', f'{import_name}.sv')
+                        if os.path.isfile(pkg_path):
+                            search_paths.append(os.path.dirname(pkg_path))
+                            break
+
+            from ..parser.package_resolver import resolve_package_file, extract_types_from_package
+            pkg_path = resolve_package_file(import_name, search_paths)
+            if pkg_path:
+                pkg_types = extract_types_from_package(pkg_path)
+                for name, val in pkg_types.items():
+                    if isinstance(val, int):
+                        ts.params[name] = ('parameter', val)
+        except Exception as e:
+            print(f"  [package import] {import_name}: {e}", file=__import__('sys').stderr)
 
     def _extract_clock(self, timing) -> str | None:
         if hasattr(timing, 'at') and timing.at is not None:
@@ -941,6 +1001,12 @@ class RTLParser:
 
         if k == SyntaxKind.IdentifierName:
             name = self._token_text(node.identifier)
+            if getattr(self, '_genvar_subst', None) and name in self._genvar_subst:
+                val = self._genvar_subst[name]
+                if isinstance(val, int):
+                    bw = max(val.bit_length(), 1)
+                    return z3.BitVecVal(val, bw)
+                return z3.BitVecVal(val, 1)
             w = self._signal_width(name, self._current_ts)
             if name in self._current_ts.state_vars:
                 return self._current_ts.get_cur(name)
