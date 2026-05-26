@@ -771,7 +771,7 @@ class RTLParser:
         if k == SyntaxKind.ExpressionStatement:
             result = {}
             expr = stmt.expr
-            if expr.kind == SyntaxKind.AssignmentExpression:
+            if expr is not None and hasattr(expr, 'kind') and expr.kind == SyntaxKind.AssignmentExpression:
                 lname = self._extract_name(expr.left)
                 if lname is not None:
                     if lname not in ts.state_vars and lname not in ts.inputs:
@@ -789,14 +789,12 @@ class RTLParser:
                 if not hasattr(item, 'kind') or not hasattr(item, 'getFirstToken'):
                     continue
                 item_assignments = self._collect_comb_assignments(item, ts, result)
-                result.update(item_assignments)
+                if item_assignments:
+                    result.update(item_assignments)
             return result
         if k == SyntaxKind.ForLoopStatement:
             result = dict(prior)
-            # Evaluate loop bounds
-            init_val = None
-            bound_val = None
-            step = 1
+            init_val = None; bound_val = None; step = 1; loop_body = None
             for child in stmt:
                 if hasattr(child, 'kind') and not isinstance(child.kind, int):
                     if child.kind.name == 'ForVariableDeclaration':
@@ -804,26 +802,42 @@ class RTLParser:
                         for d in decls:
                             if hasattr(d, 'initializer') and d.initializer is not None:
                                 init_val = self._eval_literal_expr(d.initializer.expr, ts)
-                            if hasattr(d, 'initializer') and d.initializer is not None:
-                                init_val = self._eval_literal_expr(d.initializer.expr, ts)
-                    elif child.kind.name == 'LessThanExpression' or child.kind.name == 'LessThanEqualExpression':
+                    elif child.kind.name in ('LessThanExpression', 'LessThanEqualExpression'):
                         bound_val = self._eval_literal_expr(child.right, ts)
                         if child.kind.name == 'LessThanEqualExpression' and bound_val is not None:
                             bound_val += 1
-                    elif child.kind.name == 'PostincrementExpression' or child.kind.name == 'PreincrementExpression':
+                    elif child.kind.name in ('PostincrementExpression', 'PreincrementExpression'):
                         step = 1
-                    elif child.kind.name == 'PostdecrementExpression' or child.kind.name == 'PredecrementExpression':
+                    elif child.kind.name in ('PostdecrementExpression', 'PredecrementExpression'):
                         step = -1
                     elif child.kind == SyntaxKind.SequentialBlockStatement:
                         loop_body = child
-            if init_val is not None and bound_val is not None and step != 0:
+            if init_val is not None and bound_val is not None and step != 0 and loop_body is not None:
+                saved = getattr(self, '_genvar_subst', None) or {}
                 for i in range(init_val, bound_val, step):
-                    self._genvar_subst = {'i': i}
+                    self._genvar_subst = {**saved, 'i': i}
                     body_result = self._collect_comb_assignments(loop_body, ts, result)
-                    result.update(body_result)
-                self._genvar_subst = None
-            return result
-        return {}
+                    if body_result is None:
+                        continue
+                    for var_name, expr in body_result.items():
+                        if var_name in result:
+                            old_val = result[var_name]
+                            bw = max(old_val.size(), expr.size())
+                            if old_val.size() < bw:
+                                old_val = z3.ZeroExt(bw - old_val.size(), old_val)
+                            bit_val = z3.Extract(i, i, expr) if i < expr.size() else z3.BitVecVal(0, 1)
+                            if i >= bw:
+                                result[var_name] = z3.Concat(z3.ZeroExt(i - bw, old_val), bit_val)
+                            elif i == bw - 1:
+                                upper = z3.Extract(bw - 2, 0, old_val) if bw > 1 else z3.BitVecVal(0, 1)
+                                result[var_name] = z3.Concat(bit_val, upper) if bw > 1 else bit_val
+                            elif i == 0:
+                                rest = z3.Extract(bw - 1, 1, old_val) if bw > 1 else z3.BitVecVal(0, 1)
+                                result[var_name] = z3.Concat(rest, bit_val) if bw > 1 else bit_val
+                            else:
+                                upper = z3.Extract(bw - 1, i + 1, old_val)
+                                lower = z3.Extract(i - 1, 0, old_val)
+                                result[var_name] = z3.Concat(upper, bit_val, lower)
 
     def _collect_case_assignments(self, stmt, ts, prior: dict = None) -> dict:
         """Process a case statement within always_comb, using prior as fallback defaults."""

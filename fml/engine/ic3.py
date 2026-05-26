@@ -160,10 +160,7 @@ class IC3:
                 lits = cube.children()
             else:
                 lits = [cube]
-            sig_lits = frozenset(
-                str(l) for l in lits
-                if any(pv in str(l) for pv in p_var_strs)
-            )
+            sig_lits = frozenset(str(l) for l in lits)
             return sig_lits
 
         def _push_cube(cube, i):

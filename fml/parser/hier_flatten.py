@@ -162,6 +162,10 @@ class HierarchyFlattener:
 
     def _resolve_name(self, node, ts) -> z3.BitVecRef | None:
         """Resolve a port connection expression to a Z3 variable."""
+        # Unwrap property/sequence wrappers
+        while hasattr(node, 'kind') and str(node.kind).endswith('PropertyExpr') or \
+              hasattr(node, 'kind') and str(node.kind).endswith('SequenceExpr'):
+            node = node.expr if hasattr(node, 'expr') else node
         k = node.kind
         if k == SyntaxKind.IdentifierName:
             name = _token_text(node.identifier)
