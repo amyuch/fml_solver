@@ -19,6 +19,7 @@ class TransitionSystem:
         self.state_vars: dict[str, StateVar] = {}
         self.inputs: dict[str, StateVar] = {}
         self.params: dict[str, tuple[int, int | None]] = {}
+        self._param_dims: dict[str, list[int]] = {}
         self.signed_vars: set[str] = set()
         self._cur: dict[str, z3.BitVec] = {}
         self._next: dict[str, z3.BitVec] = {}
@@ -43,6 +44,26 @@ class TransitionSystem:
         )
         if signed:
             self.signed_vars.add(name)
+
+    def widen_state_var(self, name: str, new_width: int):
+        if name not in self.state_vars:
+            return
+        old_sv = self.state_vars[name]
+        if new_width <= old_sv.width:
+            return
+        self._remove_init_constraint(name)
+        self.state_vars[name] = StateVar(name, new_width, old_sv.init_val)
+        self._cur[name] = z3.BitVec(f"{name}", new_width)
+        self._next[name] = z3.BitVec(f"{name}_next", new_width)
+        self._init_constraints.append(
+            self._cur[name] == z3.BitVecVal(old_sv.init_val, new_width)
+        )
+
+    def _remove_init_constraint(self, name: str):
+        self._init_constraints = [
+            c for c in self._init_constraints
+            if not (isinstance(c, z3.BoolRef) and name in str(c))
+        ]
 
     def add_input(self, name: str, width: int, signed: bool = False):
         iv = StateVar(name, width)
@@ -94,6 +115,12 @@ class TransitionSystem:
     def add_param(self, name: str, width: int, init_val: int | None = None):
         self.params[name] = (width, init_val)
 
+    def set_param_dims(self, name: str, dims: list[int]):
+        self._param_dims[name] = dims
+
+    def get_param_dims(self, name: str) -> list[int]:
+        return self._param_dims.get(name, [])
+
     @property
     def assumption_expr(self) -> z3.BoolRef:
         return z3.And(*self.assumptions) if self.assumptions else z3.BoolVal(True)
@@ -104,6 +131,13 @@ class TransitionSystem:
     @property
     def comb_expr(self) -> z3.BoolRef:
         return z3.And(*self._comb_constraints) if self._comb_constraints else z3.BoolVal(True)
+
+    @property
+    def comb_expr_next(self) -> z3.BoolRef:
+        if not self._comb_constraints:
+            return z3.BoolVal(True)
+        cur_to_next = [(self._cur[name], self._next[name]) for name in self.state_vars]
+        return z3.And(*[z3.substitute(c, *cur_to_next) for c in self._comb_constraints])
 
     @property
     def init_expr(self) -> z3.BoolRef:

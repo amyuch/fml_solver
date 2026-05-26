@@ -62,11 +62,16 @@ class SATIC3:
             return self._core_cache[key]
 
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
-        P_next = z3.substitute(P, *cur_to_next)
-        ts_cn = z3.substitute(ts.comb_expr, *cur_to_next)
+        inp_to_next = [(ts.get_inp(name), z3.BitVec(f"{name}_inp_next", ts.inputs[name].width))
+                       for name in ts.inputs]
+        all_to_next = cur_to_next + inp_to_next
+        P_next = z3.substitute(P, *all_to_next)
+        ts_cn = z3.substitute(ts.comb_expr, *all_to_next)
 
         cache = {
             "cur_to_next": cur_to_next,
+            "inp_to_next": inp_to_next,
+            "all_to_next": all_to_next,
             "P_next": P_next,
             "ts_cn": ts_cn,
         }
@@ -76,16 +81,17 @@ class SATIC3:
     def _prove_property(self, P, pname, verbose):
         ts = self.ts
         cc = self._build_core_cache(P, ts)
-        cur_to_next = cc["cur_to_next"]
+        all_to_next = cc["all_to_next"]
         P_next = cc["P_next"]
 
-        if self._sat_check(z3.And([ts.init_expr, ts.assumption_expr, z3.Not(P)])):
+        if self._sat_check(z3.And([ts.init_expr, ts.comb_expr, ts.assumption_expr, z3.Not(P)])):
             if verbose:
                 print(f"      counterexample at initial state")
             return {"result": "fail", "property": pname, "bound": 0}
 
         F = [[] for _ in range(self.max_frames + 2)]
         F[0].append(ts.init_expr)
+        F[0].append(ts.comb_expr)
 
         for k in range(1, self.max_frames + 1):
             if verbose:
@@ -115,7 +121,7 @@ class SATIC3:
         return {"result": "unknown", "property": pname, "bound": self.max_frames}
 
     def _strengthen(self, k, F, P, P_next, ts, cc, verbose):
-        cur_to_next = cc["cur_to_next"]
+        cur_to_next = cc["all_to_next"]
         heap = []
         seq = 0
 
@@ -182,7 +188,7 @@ class SATIC3:
 
     def _check_predecessor(self, cube, i, F, P, P_next, ts, cc):
         """F[i-1] ∧ T ∧ comb_next ∧ cube_next — SAT? => predecessor exists."""
-        cube_next = z3.substitute(cube, *cc["cur_to_next"])
+        cube_next = z3.substitute(cube, *cc["all_to_next"])
         parts = []
         if i == 0:
             parts.append(ts.init_expr)
@@ -219,7 +225,7 @@ class SATIC3:
             if not test_lits:
                 continue
             test_cube = z3.And(*test_lits) if len(test_lits) > 1 else test_lits[0]
-            test_next = z3.substitute(test_cube, *cc["cur_to_next"])
+            test_next = z3.substitute(test_cube, *cc["all_to_next"])
 
             parts = []
             if i == 0:
@@ -318,7 +324,7 @@ class SATIC3:
                 continue
 
             for c in candidates:
-                cn = z3.substitute(z3.Not(c), *cc["cur_to_next"])
+                cn = z3.substitute(z3.Not(c), *cc["all_to_next"])
                 parts = []
                 for cc_clause in frm:
                     parts.append(cc_clause)

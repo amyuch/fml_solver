@@ -6,28 +6,51 @@ from pyslang.syntax import SyntaxKind
 from pyslang.parsing import TokenKind
 from ..ir.transition_system import TransitionSystem
 
+from .utils import _token_text, _eval_literal, _extract_name
+from .eval_expr import (
+    _is_signed_expr, _is_signed_type,
+    _extract_width_from_node, _dimension_width,
+    _signal_width, _eval_literal_expr, _expr_width,
+)
+from .node_to_z3 import (
+    _node_to_z3, _z3_promote_pair, _z3_promote,
+    _extract_call_args, _unwrap_property_wrapper, _process_system_func,
+)
 
 def _z3_slt(a, b):
     ctx = a.ctx
     return z3.BoolRef(z3.Z3_mk_bvslt(ctx.ref(), a.as_ast(), b.as_ast()), ctx)
 
-
 def _z3_sle(a, b):
     ctx = a.ctx
     return z3.BoolRef(z3.Z3_mk_bvsle(ctx.ref(), a.as_ast(), b.as_ast()), ctx)
-
 
 def _z3_sgt(a, b):
     ctx = a.ctx
     return z3.BoolRef(z3.Z3_mk_bvsgt(ctx.ref(), a.as_ast(), b.as_ast()), ctx)
 
-
 def _z3_sge(a, b):
     ctx = a.ctx
     return z3.BoolRef(z3.Z3_mk_bvsge(ctx.ref(), a.as_ast(), b.as_ast()), ctx)
 
-
 class RTLParser:
+    # Imported methods
+    _token_text = staticmethod(_token_text)
+    _eval_literal = staticmethod(_eval_literal)
+    _extract_name = staticmethod(_extract_name)
+    _is_signed_expr = _is_signed_expr
+    _is_signed_type = _is_signed_type
+    _extract_width_from_node = _extract_width_from_node
+    _dimension_width = _dimension_width
+    _signal_width = _signal_width
+    _eval_literal_expr = _eval_literal_expr
+    _expr_width = _expr_width
+    _node_to_z3 = _node_to_z3
+    _z3_promote_pair = _z3_promote_pair
+    _z3_promote = _z3_promote
+    _extract_call_args = _extract_call_args
+    _unwrap_property_wrapper = _unwrap_property_wrapper
+    _process_system_func = _process_system_func
     def __init__(self):
         self.driver = Driver()
         self.driver.addStandardArgs()
@@ -70,7 +93,9 @@ class RTLParser:
         header = mod_node.header
         mod_name = self._token_text(header.name)
         ts = TransitionSystem(mod_name)
+        self._current_ts = ts
         self._extract_header_params(header, ts)
+        self._extract_body_params(mod_node, ts)
         self._extract_ports(header, ts)
         self._resolve_header_imports(header, ts)
         self._extract_body(mod_node, ts)
@@ -82,10 +107,30 @@ class RTLParser:
                 if hasattr(p, 'kind') and p.kind == SyntaxKind.ParameterDeclaration:
                     self._process_param_decl(p, ts)
 
+    def _extract_body_params(self, mod_node, ts):
+        for member in mod_node.members:
+            k = member.kind
+            if k == SyntaxKind.ParameterDeclarationStatement:
+                self._process_parameter_declaration(member, ts)
+            elif k == SyntaxKind.GenerateRegion:
+                self._extract_generate_params(member, ts)
+
+    def _extract_generate_params(self, node, ts):
+        for member in node.members:
+            k = member.kind
+            if k == SyntaxKind.ParameterDeclarationStatement:
+                self._process_parameter_declaration(member, ts)
+
     def _process_param_decl(self, node, ts: TransitionSystem, width_override: int = None):
         w = width_override
         if w is None and hasattr(node, 'type') and node.type is not None:
             w = self._extract_width_from_node(node.type, ts)
+            packed_dims = self._extract_packed_dims(node.type, ts)
+            if packed_dims:
+                total = 1
+                for d in packed_dims:
+                    total *= d
+                w = total
         if w is None or w <= 0:
             w = 1
         for decl in node.declarators:
@@ -95,39 +140,14 @@ class RTLParser:
                 init_val = self._eval_literal_expr(decl.initializer.expr, ts)
             if name not in ts.params:
                 ts.add_param(name, w, init_val)
+                if packed_dims:
+                    ts.set_param_dims(name, packed_dims)
 
     def _resolve_header_imports(self, header, ts: TransitionSystem):
         """Resolve package imports from the module header and inject params."""
         for child in header:
             if hasattr(child, 'kind') and child.kind == SyntaxKind.PackageImportDeclaration:
                 self._resolve_package_import(child, ts)
-
-    def _is_signed_expr(self, node) -> bool:
-        ts = getattr(self, '_current_ts', None)
-        if ts is None or not ts.signed_vars:
-            return False
-        k = node.kind
-        if k == SyntaxKind.IdentifierName:
-            name = self._token_text(node.identifier)
-            return name in ts.signed_vars
-        if hasattr(node, 'left') and node.left is not None and hasattr(node.left, 'kind'):
-            if self._is_signed_expr(node.left):
-                return True
-        if hasattr(node, 'right') and node.right is not None and hasattr(node.right, 'kind'):
-            if self._is_signed_expr(node.right):
-                return True
-        if hasattr(node, 'operand') and node.operand is not None and hasattr(node.operand, 'kind'):
-            if self._is_signed_expr(node.operand):
-                return True
-        return False
-
-    def _is_signed_type(self, node) -> bool:
-        if hasattr(node, 'signing') and node.signing is not None:
-            sk = node.signing.kind
-            if hasattr(sk, 'name'):
-                return 'Signed' in sk.name
-            return sk == TokenKind.SignedKeyword
-        return False
 
     def _extract_ports(self, header, ts: TransitionSystem):
         last_direction = None
@@ -153,13 +173,6 @@ class RTLParser:
             elif direction == "inout":
                 ts.add_state_var(name, width, signed=signed)
 
-    def _token_text(self, tok) -> str:
-        if hasattr(tok, 'valueText'):
-            return str(tok.valueText)
-        if hasattr(tok, 'rawText'):
-            return str(tok.rawText)
-        return str(tok).strip()
-
     def _parse_port_direct(self, port) -> tuple:
         ph = port.header
         direction = None
@@ -184,65 +197,6 @@ class RTLParser:
             direction = "wire"
 
         return (name, direction, width)
-
-    def _extract_width_from_node(self, node, ts: TransitionSystem = None) -> int | None:
-        if node.kind == SyntaxKind.ImplicitType:
-            if hasattr(node, 'dimensions') and node.dimensions:
-                for dim in node.dimensions:
-                    w = self._dimension_width(dim, ts)
-                    if w is not None and w > 1:
-                        return w
-            return None
-        if node.kind == SyntaxKind.NamedType:
-            type_name = None
-            for child in node:
-                if hasattr(child, 'kind'):
-                    if child.kind == SyntaxKind.IdentifierName:
-                        type_name = str(child).strip()
-                    elif child.kind == SyntaxKind.IdentifierSelectName:
-                        type_name = self._token_text(child.identifier).strip()
-            if type_name and ts and type_name in ts.params and ts.params[type_name][0] == 'type_width':
-                bw = ts.params[type_name][1]
-                return bw
-            if hasattr(node, 'dimensions') and node.dimensions:
-                for dim in node.dimensions:
-                    w = self._dimension_width(dim, ts)
-                    if w is not None and w > 1:
-                        return w
-            return None
-        if hasattr(node, 'dimensions') and node.dimensions:
-            for dim in node.dimensions:
-                w = self._dimension_width(dim, ts)
-                if w is not None and w > 1:
-                    return w
-        return None
-
-    def _dimension_width(self, dim, ts: TransitionSystem = None) -> int:
-        if ts is None:
-            ts = getattr(self, '_current_ts', None)
-        if not hasattr(dim, 'specifier'):
-            return 1
-        spec = dim.specifier
-        if not hasattr(spec, 'selector'):
-            return 1
-        sel = spec.selector
-        if hasattr(sel, 'left') and hasattr(sel, 'right'):
-            lo = self._eval_literal_expr(sel.left, ts)
-            ro = self._eval_literal_expr(sel.right, ts)
-            if lo is not None and ro is not None:
-                return abs(lo - ro) + 1
-        return 1
-
-    def _eval_literal(self, node) -> int | None:
-        if hasattr(node, 'literal'):
-            return self._eval_literal(node.literal)
-        text = self._token_text(node) if hasattr(node, 'valueText') or hasattr(node, 'rawText') else None
-        if text:
-            try:
-                return int(text, 0)
-            except (ValueError, AttributeError):
-                return None
-        return None
 
     def _extract_body(self, mod_node, ts: TransitionSystem):
         self._current_ts = ts
@@ -352,7 +306,9 @@ class RTLParser:
                 step = step_val
 
         for i in range(init_val, bound_val, step):
-            self._process_generate_body(node.block, ts, genvar_subst={genvar_name: i})
+            outer_subst = getattr(self, '_genvar_subst', None) or {}
+            merged = {**outer_subst, genvar_name: i}
+            self._process_generate_body(node.block, ts, genvar_subst=merged)
 
     def _eval_stop_bound(self, node, ts) -> int | None:
         k = node.kind
@@ -404,7 +360,8 @@ class RTLParser:
 
     def _dispatch_generate_member(self, node, ts: TransitionSystem, genvar_subst=None):
         if genvar_subst:
-            self._genvar_subst = genvar_subst
+            existing = getattr(self, '_genvar_subst', None) or {}
+            self._genvar_subst = {**existing, **genvar_subst}
         k = node.kind
         if k == SyntaxKind.AlwaysFFBlock:
             self._process_always_ff(node, ts)
@@ -441,104 +398,20 @@ class RTLParser:
         if genvar_subst:
             self._genvar_subst = None
 
-    def _eval_literal_expr(self, node, ts: TransitionSystem = None) -> int | None:
-        if node is None:
-            return None
-        k = node.kind
-
-        if k == SyntaxKind.IntegerLiteralExpression:
-            return self._eval_literal(node.literal)
-        if k == SyntaxKind.IntegerVectorExpression:
-            val = self._eval_literal(node.value) if hasattr(node, 'value') else None
-            return val
-
-        if k == SyntaxKind.IdentifierName:
-            name = self._token_text(node.identifier)
-            if getattr(self, '_genvar_subst', None) and name in self._genvar_subst:
-                return self._genvar_subst[name]
-            if ts is not None and name in ts.params:
-                return ts.params[name][1]
-            return None
-
-        if k == SyntaxKind.ParenthesizedExpression:
-            return self._eval_literal_expr(node.expression, ts)
-
-        has_operand = hasattr(node, 'operand') and node.operand is not None
-        has_left = hasattr(node, 'left') and node.left is not None
-        has_right = hasattr(node, 'right') and node.right is not None
-
-        if has_operand and not has_left and not has_right:
-            inner = self._eval_literal_expr(node.operand, ts)
-            if inner is None:
-                return None
-            if k == SyntaxKind.UnaryMinusExpression:
-                return -inner
-            if k == SyntaxKind.UnaryPlusExpression:
-                return inner
-            if k == SyntaxKind.UnaryBitwiseNotExpression:
-                return ~inner
-            if k == SyntaxKind.UnaryLogicalNotExpression:
-                return 0 if inner else 1
-            return None
-
-        if has_left and has_right:
-            left = self._eval_literal_expr(node.left, ts)
-            right = self._eval_literal_expr(node.right, ts)
-            if left is None or right is None:
-                return None
-            if k == SyntaxKind.AddExpression:
-                return left + right
-            if k == SyntaxKind.SubtractExpression:
-                return left - right
-            if k == SyntaxKind.MultiplyExpression:
-                return left * right
-            if k == SyntaxKind.DivideExpression:
-                return left // right if right != 0 else None
-            if k == SyntaxKind.ModExpression:
-                return left % right if right != 0 else None
-            if k == SyntaxKind.EqualityExpression:
-                return 1 if left == right else 0
-            if k == SyntaxKind.InequalityExpression:
-                return 1 if left != right else 0
-            if k == SyntaxKind.LessThanExpression:
-                return 1 if left < right else 0
-            if k == SyntaxKind.GreaterThanExpression:
-                return 1 if left > right else 0
-            if k == SyntaxKind.LessThanEqualExpression:
-                return 1 if left <= right else 0
-            if k == SyntaxKind.GreaterThanEqualExpression:
-                return 1 if left >= right else 0
-            if k == SyntaxKind.BinaryAndExpression:
-                return left & right
-            if k == SyntaxKind.BinaryOrExpression:
-                return left | right
-            if k == SyntaxKind.BinaryXorExpression:
-                return left ^ right
-            if k == SyntaxKind.LogicalAndExpression:
-                return 1 if (left and right) else 0
-            if k == SyntaxKind.LogicalOrExpression:
-                return 1 if (left or right) else 0
-            if k == SyntaxKind.LogicalShiftRightExpression:
-                return left >> right
-            if k == SyntaxKind.LogicalShiftLeftExpression:
-                return left << right
-            if k == SyntaxKind.ArithmeticShiftRightExpression:
-                return left >> right
-            if k == SyntaxKind.ArithmeticShiftLeftExpression:
-                return left << right
-            return None
-
-        return None
-
     def _process_data_declaration(self, node, ts: TransitionSystem):
-        w = self._extract_width_from_node(node.type, ts)
-        if w is None or w <= 0:
-            w = 1
         signed = self._is_signed_type(node.type)
         array_dims = self._extract_array_dims(node.type, ts)
-        # Multiply base width by array dimensions for total packed width
-        for d in array_dims:
+        packed_dims = self._extract_packed_dims(node.type, ts)
+        all_dims = packed_dims + array_dims
+        w = 1
+        for d in all_dims:
             w *= d
+        if w <= 0 or not all_dims:
+            w_base = self._extract_width_from_node(node.type, ts)
+            if w_base is not None and w_base > 0:
+                w = w_base
+            if w <= 0:
+                w = 1
         for decl in node.declarators:
             if not hasattr(decl, 'name'):
                 continue
@@ -546,10 +419,11 @@ class RTLParser:
                 name = self._token_text(decl.name)
             except Exception:
                 continue
-            if name not in ts.state_vars and name not in ts.inputs:
+            is_new = name not in ts.state_vars and name not in ts.inputs
+            if is_new:
                 ts.add_state_var(name, w, signed=signed)
-            if array_dims:
-                ts.set_var_dims(name, array_dims)
+            if all_dims and is_new:
+                ts.set_var_dims(name, all_dims)
 
     def _extract_array_dims(self, type_node, ts) -> list[int]:
         dims = []
@@ -565,6 +439,17 @@ class RTLParser:
                                 if lv is not None and rv is not None:
                                     dims.append(abs(lv - rv) + 1)
         # Only extract from NamedType's IdentifierSelectName, not from base types
+        return dims
+
+    def _extract_packed_dims(self, type_node, ts) -> list[int]:
+        if type_node.kind == SyntaxKind.NamedType:
+            return []
+        dims = []
+        if hasattr(type_node, 'dimensions') and type_node.dimensions:
+            for dim in type_node.dimensions:
+                dw = self._dimension_width(dim, ts)
+                if dw is not None and dw > 0:
+                    dims.append(dw)
         return dims
 
     def _process_typedef(self, node, ts: TransitionSystem):
@@ -623,13 +508,6 @@ class RTLParser:
                                     if lv is not None and rv is not None:
                                         dims.append(abs(lv - rv) + 1)
         return dims
-
-    def _signal_width(self, name: str, ts: TransitionSystem) -> int:
-        if name in ts.state_vars:
-            return ts.state_vars[name].width
-        if name in ts.inputs:
-            return ts.inputs[name].width
-        return 1
 
     def _process_always_ff(self, block, ts: TransitionSystem):
         self._current_ts = ts
@@ -851,13 +729,6 @@ class RTLParser:
             return {lname: r_expr}
         return {}
 
-    def _extract_name(self, node) -> str | None:
-        if node.kind == SyntaxKind.IdentifierName:
-            return self._token_text(node.identifier)
-        if node.kind == SyntaxKind.IdentifierSelectName:
-            return self._token_text(node.identifier)
-        return None
-
     def _process_expr_stmt(self, stmt, ts: TransitionSystem):
         self._current_ts = ts
         expr = stmt.expr
@@ -912,6 +783,8 @@ class RTLParser:
         if k == SyntaxKind.SequentialBlockStatement:
             result = dict(prior)
             for item in stmt.items:
+                if not hasattr(item, 'kind') or not hasattr(item, 'getFirstToken'):
+                    continue
                 item_assignments = self._collect_comb_assignments(item, ts, result)
                 result.update(item_assignments)
             return result
@@ -962,17 +835,54 @@ class RTLParser:
                     continue
                 if lname not in ts.state_vars and lname not in ts.inputs:
                     w = self._expr_width(right, ts)
+                    if w is None or w <= 0:
+                        w = 1
                     ts.add_state_var(lname, w)
+                l_expr = self._build_lhs_expr(left, lname, ts)
+                if l_expr is None:
+                    l_expr = ts.get_cur(lname)
                 r_expr = self._node_to_z3(right)
-                cur = ts.get_cur(lname)
-                cw = cur.size()
-                ew = r_expr.size()
-                if cw != ew:
-                    if cw > ew:
-                        r_expr = z3.ZeroExt(cw - ew, r_expr)
+                lw = l_expr.size()
+                rw = r_expr.size()
+                if lw != rw:
+                    if lw > rw:
+                        r_expr = z3.ZeroExt(lw - rw, r_expr)
                     else:
-                        r_expr = z3.Extract(cw - 1, 0, r_expr)
-                ts.add_comb_constraint(cur == r_expr)
+                        r_expr = z3.Extract(lw - 1, 0, r_expr)
+                ts.add_comb_constraint(l_expr == r_expr)
+
+    def _build_lhs_expr(self, left, lname, ts):
+        if not hasattr(left, 'selectors') or not left.selectors:
+            return None
+        base = ts.get_cur(lname)
+        bw = base.size()
+        result = base
+        for sel in left.selectors:
+            if sel.kind == SyntaxKind.ElementSelect:
+                s = sel.selector
+                sk = s.kind
+                if sk == SyntaxKind.BitSelect:
+                    idx_expr = self._eval_literal_expr(s.expr, ts)
+                    if idx_expr is None:
+                        continue
+                    if idx_expr >= bw:
+                        ts.widen_state_var(lname, idx_expr + 1)
+                        base = ts.get_cur(lname)
+                        bw = base.size()
+                        result = base
+                    result = z3.Extract(idx_expr, idx_expr, result)
+                elif sk == SyntaxKind.SimpleRangeSelect:
+                    hi = self._eval_literal_expr(s.left, ts)
+                    lo = self._eval_literal_expr(s.right, ts)
+                    if hi is not None and lo is not None:
+                        if lo > hi:
+                            lo, hi = hi, lo
+                        if hi >= bw:
+                            ts.widen_state_var(lname, hi + 1)
+                            base = ts.get_cur(lname)
+                            result = base
+                        result = z3.Extract(hi, lo, result)
+        return result
 
     def _process_assertion(self, stmt, ts: TransitionSystem,
                            directive: str | None = None):
@@ -1253,521 +1163,6 @@ class RTLParser:
         if prop_bv is not None:
             return (prop_bv != 0)
         return None
-
-    def _expr_width(self, node, ts: TransitionSystem) -> int:
-        k = node.kind
-        if k == SyntaxKind.IdentifierName:
-            name = self._token_text(node.identifier)
-            return self._signal_width(name, ts)
-        if k == SyntaxKind.IntegerLiteralExpression:
-            try:
-                val = int(self._token_text(node.literal), 0)
-                return max(val.bit_length(), 1)
-            except ValueError:
-                return 1
-        if k == SyntaxKind.IntegerVectorExpression:
-            sz = node.size
-            try:
-                return int(self._token_text(sz), 0)
-            except (ValueError, AttributeError):
-                return 8
-        if k in (SyntaxKind.AddExpression, SyntaxKind.SubtractExpression,
-                 SyntaxKind.MultiplyExpression):
-            return max(self._expr_width(node.left, ts), self._expr_width(node.right, ts))
-        if k in (SyntaxKind.EqualityExpression, SyntaxKind.InequalityExpression,
-                 SyntaxKind.LessThanExpression, SyntaxKind.GreaterThanExpression,
-                 SyntaxKind.LessThanEqualExpression, SyntaxKind.GreaterThanEqualExpression,
-                 SyntaxKind.CaseEqualityExpression, SyntaxKind.CaseInequalityExpression):
-            return 1
-        if k == SyntaxKind.ConcatenationExpression:
-            total = 0
-            for op in node.operands:
-                total += self._expr_width(op, ts)
-            return total
-        if k == SyntaxKind.UnaryLogicalNotExpression:
-            return self._expr_width(node.operand, ts)
-        if k == SyntaxKind.ConditionalExpression:
-            return max(self._expr_width(node.left, ts), self._expr_width(node.right, ts))
-        if k == SyntaxKind.ParenthesizedExpression:
-            return self._expr_width(node.expression, ts)
-        if k == SyntaxKind.UnaryBitwiseNotExpression:
-            return self._expr_width(node.operand, ts)
-        if k == SyntaxKind.SimplePropertyExpr:
-            return self._expr_width(node.expr, ts) if hasattr(node, 'expr') else 1
-        if k == SyntaxKind.SimpleSequenceExpr:
-            return self._expr_width(node.expr, ts) if hasattr(node, 'expr') else 1
-        if k in (SyntaxKind.AndSequenceExpr, SyntaxKind.OrSequenceExpr,
-                 SyntaxKind.IntersectSequenceExpr):
-            return 1
-        if k == SyntaxKind.IffPropertyExpr:
-            return 1
-        if k in (SyntaxKind.SUntilPropertyExpr, SyntaxKind.UntilPropertyExpr,
-                 SyntaxKind.SUntilWithPropertyExpr, SyntaxKind.UntilWithPropertyExpr):
-            return 1
-        if k == SyntaxKind.UnaryPropertyExpr:
-            return 1
-        if k == SyntaxKind.DelayedSequenceExpr:
-            return 1
-        if k == SyntaxKind.SequenceRepetition:
-            return 1
-        if k == SyntaxKind.InvocationExpression:
-            if hasattr(node, 'left') and hasattr(node.left, 'systemIdentifier'):
-                func_name = node.left.systemIdentifier.valueText
-                if func_name in ('$rose', '$fell', '$stable', '$changed'):
-                    return 1
-                if func_name == '$isunknown':
-                    return 1
-                if func_name == '$past':
-                    args = self._extract_call_args(node)
-                    if args:
-                        return self._expr_width(args[0], ts)
-                    return 1
-            return 1
-        return 1
-
-    def _node_to_z3(self, node) -> z3.BitVecRef:
-        if node is None:
-            return z3.BitVecVal(0, 1)
-        k = node.kind
-
-        if k == SyntaxKind.IdentifierName:
-            name = self._token_text(node.identifier)
-            if getattr(self, '_genvar_subst', None) and name in self._genvar_subst:
-                val = self._genvar_subst[name]
-                if isinstance(val, int):
-                    bw = max(val.bit_length(), 1)
-                    return z3.BitVecVal(val, bw)
-                return z3.BitVecVal(val, 1)
-            w = self._signal_width(name, self._current_ts)
-            if name in self._current_ts.state_vars:
-                return self._current_ts.get_cur(name)
-            if name in self._current_ts.inputs:
-                return self._current_ts.get_inp(name)
-            self._current_ts.add_state_var(name, w)
-            return self._current_ts.get_cur(name)
-
-        if k == SyntaxKind.IdentifierSelectName:
-            name = self._token_text(node.identifier)
-            w = self._signal_width(name, self._current_ts)
-            if name in self._current_ts.state_vars:
-                base = self._current_ts.get_cur(name)
-            elif name in self._current_ts.inputs:
-                base = self._current_ts.get_inp(name)
-            else:
-                self._current_ts.add_state_var(name, w)
-                base = self._current_ts.get_cur(name)
-
-            def _zext(expr, target_w):
-                ew = expr.size()
-                if ew < target_w:
-                    return z3.ZeroExt(target_w - ew, expr)
-                return expr
-
-            result = base
-            array_dims = self._current_ts.get_var_dims(name) if hasattr(self._current_ts, 'get_var_dims') else []
-            dim_idx = 0
-            for sel in node.selectors:
-                if sel.kind == SyntaxKind.ElementSelect:
-                    selector = sel.selector
-                    sk = selector.kind
-
-                    if sk == SyntaxKind.SimpleRangeSelect:
-                        left_val = self._node_to_z3(selector.left)
-                        right_val = self._node_to_z3(selector.right)
-                        if z3.is_bv_value(left_val) and z3.is_bv_value(right_val):
-                            hi = left_val.as_long()
-                            lo = right_val.as_long()
-                            if lo > hi:
-                                lo, hi = hi, lo
-                            w_sel = hi - lo + 1
-                            if w_sel == w:
-                                return result
-                            result = z3.Extract(hi, lo, result)
-                        else:
-                            right_width = self._extract_width_from_node(selector.right)
-                            if right_width is None or right_width <= 0:
-                                right_width = 1
-                            base_z = _zext(result, w + right_width)
-                            shift = _zext(left_val, w)
-                            result = z3.Extract(right_width - 1, 0, z3.LShR(result, shift))
-
-                    elif sk == SyntaxKind.BitSelect:
-                        idx = self._node_to_z3(selector.expr)
-                        if dim_idx < len(array_dims):
-                            ew = result.size() // array_dims[dim_idx]
-                            if z3.is_bv_value(idx):
-                                bit = idx.as_long()
-                                offset = bit * ew
-                                result = z3.Extract(offset + ew - 1, offset, result)
-                            else:
-                                shift = _zext(idx, result.size())
-                                result = z3.Extract(ew - 1, 0, z3.LShR(result, shift * ew))
-                            dim_idx += 1
-                        else:
-                            if z3.is_bv_value(idx):
-                                bit = idx.as_long()
-                                result = z3.Extract(bit, bit, result)
-                            else:
-                                shift = _zext(idx, w)
-                                result = z3.Extract(0, 0, z3.LShR(result, shift))
-
-                    elif sk == SyntaxKind.AscendingRangeSelect:
-                        base_expr = self._node_to_z3(selector.left)
-                        width_val = self._node_to_z3(selector.right)
-                        sw = width_val.as_long() if z3.is_bv_value(width_val) else 1
-                        shift = _zext(base_expr, w)
-                        result = z3.Extract(sw - 1, 0, z3.LShR(result, shift))
-
-                    elif sk == SyntaxKind.DescendingRangeSelect:
-                        base_expr = self._node_to_z3(selector.left)
-                        width_val = self._node_to_z3(selector.right)
-                        sw = width_val.as_long() if z3.is_bv_value(width_val) else 1
-                        shift = _zext(base_expr - (sw - 1), w)
-                        result = z3.Extract(sw - 1, 0, z3.LShR(result, shift))
-            return result
-
-        if k == SyntaxKind.IntegerLiteralExpression:
-            try:
-                val = int(self._token_text(node.literal), 0)
-                bw = max(val.bit_length(), 1)
-                return z3.BitVecVal(val, bw)
-            except ValueError:
-                return z3.BitVecVal(0, 1)
-
-        if k == SyntaxKind.IntegerVectorExpression:
-            size_str = self._token_text(node.size) if hasattr(node, 'size') else "1"
-            val_str = self._token_text(node.value) if hasattr(node, 'value') else "0"
-            base_str = self._token_text(node.base) if hasattr(node, 'base') else ""
-            try:
-                bw = int(size_str, 0)
-                base_prefix = base_str.replace("'", "")
-                if base_prefix == "h":
-                    val = int(val_str, 16)
-                elif base_prefix == "d":
-                    val = int(val_str, 10)
-                elif base_prefix == "b":
-                    val = int(val_str, 2)
-                elif base_prefix == "o":
-                    val = int(val_str, 8)
-                else:
-                    val = int(val_str, 10)
-                return z3.BitVecVal(val, bw)
-            except (ValueError, AttributeError):
-                return z3.BitVecVal(0, 8)
-
-        if k == SyntaxKind.UnaryLogicalNotExpression:
-            op = self._node_to_z3(node.operand)
-            return z3.If(op == 0, z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-
-        if k == SyntaxKind.UnaryBitwiseNotExpression:
-            op = self._node_to_z3(node.operand)
-            return ~op
-
-        if k == SyntaxKind.AddExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            return self._z3_promote(l, r, lambda a, b: a + b)
-
-        if k == SyntaxKind.SubtractExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            return self._z3_promote(l, r, lambda a, b: a - b)
-
-        if k == SyntaxKind.MultiplyExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            return self._z3_promote(l, r, lambda a, b: a * b)
-
-        if k in (SyntaxKind.DivideExpression, SyntaxKind.ModExpression):
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            return self._z3_promote(l, r, lambda a, b: z3.UDiv(a, b))
-
-        if k in (SyntaxKind.EqualityExpression, SyntaxKind.CaseEqualityExpression):
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            l, r = self._z3_promote_pair(l, r)
-            return z3.If(l == r, z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-
-        if k in (SyntaxKind.InequalityExpression, SyntaxKind.CaseInequalityExpression):
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            l, r = self._z3_promote_pair(l, r)
-            return z3.If(l != r, z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-
-        if k == SyntaxKind.BinaryAndExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            l, r = self._z3_promote_pair(l, r)
-            return l & r
-
-        if k == SyntaxKind.BinaryOrExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            l, r = self._z3_promote_pair(l, r)
-            return l | r
-
-        if k == SyntaxKind.BinaryXorExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            l, r = self._z3_promote_pair(l, r)
-            return l ^ r
-
-        if k == SyntaxKind.LogicalAndExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            l, r = self._z3_promote_pair(l, r)
-            return z3.If(z3.And(l != 0, r != 0), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-
-        if k == SyntaxKind.LogicalOrExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            l, r = self._z3_promote_pair(l, r)
-            return z3.If(z3.Or(l != 0, r != 0), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-
-        if k in (SyntaxKind.LogicalShiftLeftExpression, SyntaxKind.ArithmeticShiftLeftExpression):
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            return l << r
-
-        if k in (SyntaxKind.LogicalShiftRightExpression,):
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            return z3.LShR(l, r)
-
-        if k == SyntaxKind.ArithmeticShiftRightExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            use_signed = self._is_signed_expr(node.left)
-            if use_signed:
-                return z3.AShr(l, r)
-            return l >> r
-
-        if k == SyntaxKind.GreaterThanExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            l, r = self._z3_promote_pair(l, r)
-            if self._is_signed_expr(node.left) or self._is_signed_expr(node.right):
-                return z3.If(_z3_sgt(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-            return z3.If(z3.UGT(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-
-        if k == SyntaxKind.GreaterThanEqualExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            l, r = self._z3_promote_pair(l, r)
-            if self._is_signed_expr(node.left) or self._is_signed_expr(node.right):
-                return z3.If(_z3_sge(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-            return z3.If(z3.UGE(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-
-        if k == SyntaxKind.LessThanExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            l, r = self._z3_promote_pair(l, r)
-            if self._is_signed_expr(node.left) or self._is_signed_expr(node.right):
-                return z3.If(_z3_slt(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-            return z3.If(z3.ULT(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-
-        if k == SyntaxKind.LessThanEqualExpression:
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            l, r = self._z3_promote_pair(l, r)
-            if self._is_signed_expr(node.left) or self._is_signed_expr(node.right):
-                return z3.If(_z3_sle(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-            return z3.If(z3.ULE(l, r), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-
-        if k == SyntaxKind.ConditionalExpression:
-            pred_group = node.predicate
-            cond = self._node_to_z3(pred_group.conditions[0].expr)
-            l = self._node_to_z3(node.left)
-            r = self._node_to_z3(node.right)
-            return self._z3_promote(
-                l, r,
-                lambda a, b: z3.If(cond != 0, a, b)
-            )
-
-        if k == SyntaxKind.ParenthesizedExpression:
-            return self._node_to_z3(node.expression)
-
-        if k == SyntaxKind.ConcatenationExpression:
-            parts = []
-            for child in node.expressions:
-                if hasattr(child, 'kind') and 'Token' in str(type(child).__name__):
-                    continue
-                parts.append(self._node_to_z3(child))
-            result = parts[0] if parts else z3.BitVecVal(0, 1)
-            for p in parts[1:]:
-                result = z3.Concat(result, p)
-            return result
-
-        if k == SyntaxKind.MultipleConcatenationExpression:
-            count_node = node.expression
-            operand = self._node_to_z3(node.concatenation)
-            cnt = self._eval_literal(count_node)
-            if cnt is not None and cnt > 0:
-                parts = [operand] * cnt
-                result = parts[0]
-                for p in parts[1:]:
-                    result = z3.Concat(result, p)
-                return result
-            return operand
-
-        if k == SyntaxKind.SimplePropertyExpr:
-            if hasattr(node, 'expr'):
-                return self._node_to_z3(node.expr)
-            return z3.BitVecVal(0, 1)
-
-        if k == SyntaxKind.SimpleSequenceExpr:
-            if hasattr(node, 'expr'):
-                return self._node_to_z3(node.expr)
-            return z3.BitVecVal(0, 1)
-
-        if k == SyntaxKind.AndSequenceExpr:
-            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
-            if len(children) >= 2:
-                l = self._node_to_z3(children[0])
-                r = self._node_to_z3(children[1])
-                l, r = self._z3_promote_pair(l, r)
-                return z3.If(z3.And(l != 0, r != 0), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-            return z3.BitVecVal(0, 1)
-
-        if k == SyntaxKind.OrSequenceExpr:
-            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
-            if len(children) >= 2:
-                l = self._node_to_z3(children[0])
-                r = self._node_to_z3(children[1])
-                l, r = self._z3_promote_pair(l, r)
-                return z3.If(z3.Or(l != 0, r != 0), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-            return z3.BitVecVal(0, 1)
-
-        if k == SyntaxKind.InvocationExpression:
-            if hasattr(node, 'left') and hasattr(node.left, 'systemIdentifier'):
-                func_name = node.left.systemIdentifier.valueText
-                if func_name.startswith('$'):
-                    func_name = func_name[1:]
-                args = self._extract_call_args(node)
-                return self._process_system_func(func_name, args)
-            return z3.BitVecVal(0, 1)
-
-        if k == SyntaxKind.InsideExpression:
-            left = self._node_to_z3(node.expr)
-            ranges_node = node.ranges
-            elements = []
-            for child in ranges_node:
-                kind = child.kind
-                if kind in (TokenKind.OpenBrace, TokenKind.CloseBrace, TokenKind.Comma):
-                    continue
-                elements.append(child)
-            if not elements:
-                return z3.BitVecVal(0, 1)
-            range_vals = [self._node_to_z3(e) for e in elements]
-            return z3.If(
-                z3.Or(*[left == rv for rv in range_vals]),
-                z3.BitVecVal(1, 1),
-                z3.BitVecVal(0, 1)
-            )
-
-        if k == SyntaxKind.UnbasedUnsizedLiteralExpression:
-            txt = str(node)
-            if txt.strip() in ("'0", "'b0", "'B0"):
-                return z3.BitVecVal(0, 1)
-            if txt.strip() in ("'1", "'b1", "'B1"):
-                return z3.BitVecVal(1, 1)
-            return z3.BitVecVal(0, 1)
-
-        if k == SyntaxKind.ScopedName:
-            return self._node_to_z3(list(node)[0])
-
-        warnings.warn(f"Unhandled expression node: {k}", stacklevel=2)
-        return z3.BitVecVal(0, 1)
-
-    def _z3_promote_pair(self, a, b):
-        if z3.is_bv(a) and z3.is_bv(b):
-            wa, wb = a.size(), b.size()
-            if wa == wb:
-                return a, b
-            elif wa > wb:
-                return a, z3.ZeroExt(wa - wb, b)
-            else:
-                return z3.ZeroExt(wb - wa, a), b
-        return a, b
-
-    def _z3_promote(self, a, b, op):
-        a, b = self._z3_promote_pair(a, b)
-        return op(a, b) if z3.is_bv(a) else b
-
-    def _extract_call_args(self, node) -> list:
-        args = []
-        if hasattr(node, 'arguments') and node.arguments is not None:
-            for p in node.arguments.parameters:
-                if hasattr(p, 'expr'):
-                    args.append(p.expr)
-        return args
-
-    def _unwrap_property_wrapper(self, node):
-        while hasattr(node, 'expr') and node.kind in (SyntaxKind.SimplePropertyExpr, SyntaxKind.SimpleSequenceExpr):
-            node = node.expr
-        return node
-
-    def _process_system_func(self, func_name: str, args: list) -> z3.BitVecRef:
-        ts = self._current_ts
-
-        if func_name in ('rose', 'fell', 'stable', 'changed'):
-            if not args:
-                return z3.BitVecVal(0, 1)
-            arg_node = args[0]
-            arg_expr = self._node_to_z3(arg_node)
-            arg_width = self._expr_width(arg_node, ts)
-
-            reg_name = f"__past_{func_name}_{self._past_counter}"
-            self._past_counter += 1
-            ts.add_state_var(reg_name, arg_width)
-            ts.set_next_state(reg_name, arg_expr)
-
-            past_val = ts.get_cur(reg_name)
-
-            if func_name == 'rose':
-                return z3.If(z3.And(arg_expr != 0, past_val == 0),
-                             z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-            elif func_name == 'fell':
-                return z3.If(z3.And(arg_expr == 0, past_val != 0),
-                             z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-            elif func_name == 'stable':
-                return z3.If(arg_expr == past_val,
-                             z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-            elif func_name == 'changed':
-                return z3.If(arg_expr != past_val,
-                             z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
-            return z3.BitVecVal(0, 1)
-
-        if func_name == 'isunknown':
-            return z3.BitVecVal(0, 1)
-
-        if func_name == 'past':
-            if not args:
-                return z3.BitVecVal(0, 1)
-            arg_node = args[0]
-            depth = 1
-            if len(args) >= 2:
-                depth_node = self._unwrap_property_wrapper(args[1])
-                depth_val = self._eval_literal(depth_node)
-                if depth_val is not None:
-                    depth = max(depth_val, 1)
-            arg_expr = self._node_to_z3(arg_node)
-            arg_width = self._expr_width(arg_node, ts)
-
-            # Create depth registers forming a shift chain
-            reg_names = [f"__past_{func_name}_{self._past_counter}_{i}" for i in range(depth)]
-            self._past_counter += 1
-            for i, rname in enumerate(reg_names):
-                ts.add_state_var(rname, arg_width)
-                if i == 0:
-                    ts.set_next_state(rname, arg_expr)
-                else:
-                    ts.set_next_state(rname, ts.get_cur(reg_names[i - 1]))
-
-            return ts.get_cur(reg_names[-1])
-
-        return z3.BitVecVal(0, 1)
 
     def parse_to_ts(self, filepath: str, top_name: str = None) -> TransitionSystem:
         systems = self.parse_file(filepath)

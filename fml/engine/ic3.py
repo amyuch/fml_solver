@@ -54,12 +54,15 @@ class IC3:
     def _prove_property(self, P: z3.BoolRef, pname: str, verbose: bool) -> dict:
         ts = self.ts
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
-        P_next = z3.substitute(P, *cur_to_next)
+        inp_to_next = [(ts.get_inp(name), z3.BitVec(f"{name}_inp_next", ts.inputs[name].width))
+                       for name in ts.inputs]
+        P_next = z3.substitute(P, *(cur_to_next + inp_to_next))
 
         # Base case: check if any initial state violates P
         s0 = z3.Solver()
         s0.set("timeout", self.ts.timeout)
         s0.add(ts.init_expr)
+        s0.add(ts.comb_expr)
         s0.add(ts.assumption_expr)
         s0.add(z3.Not(P))
         if s0.check() == z3.sat:
@@ -77,6 +80,7 @@ class IC3:
 
         frames: list[list[z3.BoolRef]] = [[] for _ in range(self.max_frames + 2)]
         frames[0].append(ts.init_expr)
+        frames[0].append(ts.comb_expr)
 
         if verbose:
             print(f"  IC3 proving: {pname}")
@@ -134,7 +138,9 @@ class IC3:
 
     def _strengthen(self, k: int, frames, P, P_next, ts, verbose) -> bool | str | dict:
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
-        ts_cn = z3.substitute(ts.comb_expr, *cur_to_next)
+        inp_to_next = [(ts.get_inp(name), z3.BitVec(f"{name}_inp_next", ts.inputs[name].width))
+                       for name in ts.inputs]
+        ts_cn = z3.substitute(ts.comb_expr, *(cur_to_next + inp_to_next))
 
         heap = []
         seq = 0
@@ -232,11 +238,13 @@ class IC3:
                 ns = z3.Solver()
                 ns.set("timeout", 2000)
                 cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
+                inp_to_next = [(ts.get_inp(name), z3.BitVec(f"{name}_inp_next", ts.inputs[name].width))
+                               for name in ts.inputs]
                 ns.add(final_cube)
                 ns.add(ts.assumption_expr)
                 ns.add(ts.comb_expr)
                 ns.add(ts.trans_expr)
-                ns.add(z3.substitute(ts.comb_expr, *cur_to_next))
+                ns.add(z3.substitute(ts.comb_expr, *(cur_to_next + inp_to_next)))
                 ns.add(z3.Not(P_next))
                 if ns.check() == z3.sat:
                     nm = ns.model()
@@ -355,6 +363,9 @@ class IC3:
 
     def _check_predecessor(self, cube, i, frames, P, ts):
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
+        inp_to_next = [(ts.get_inp(name), z3.BitVec(f"{name}_inp_next", ts.inputs[name].width))
+                       for name in ts.inputs]
+        all_to_next = cur_to_next + inp_to_next
         s = z3.Solver()
         s.set("timeout", ts.timeout if 'ts' in dir() else self.ts.timeout)
         if i == 0:
@@ -367,8 +378,8 @@ class IC3:
         s.add(ts.assumption_expr)
         s.add(ts.comb_expr)
         s.add(ts.trans_expr)
-        s.add(z3.substitute(ts.comb_expr, *cur_to_next))
-        s.add(z3.substitute(cube, *cur_to_next))
+        s.add(z3.substitute(ts.comb_expr, *all_to_next))
+        s.add(z3.substitute(cube, *all_to_next))
 
         r = s.check()
         if r == z3.unsat:
@@ -392,9 +403,12 @@ class IC3:
             return z3.Not(cube)
 
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
+        inp_to_next = [(ts.get_inp(name), z3.BitVec(f"{name}_inp_next", ts.inputs[name].width))
+                       for name in ts.inputs]
+        all_to_next = cur_to_next + inp_to_next
         lits_next = []
         for lit in lits_cur:
-            lits_next.append(z3.substitute(lit, *cur_to_next))
+            lits_next.append(z3.substitute(lit, *all_to_next))
 
         s = z3.Solver()
         s.set("timeout", 1000)
@@ -408,7 +422,7 @@ class IC3:
 
         s.add(ts.comb_expr)
         s.add(ts.trans_expr)
-        s.add(z3.substitute(ts.comb_expr, *cur_to_next))
+        s.add(z3.substitute(ts.comb_expr, *all_to_next))
 
         trackers = []
         for j, lit in enumerate(lits_next):
@@ -524,6 +538,9 @@ class IC3:
                 p_var_strs.add(cur_str)
 
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
+        inp_to_next = [(ts.get_inp(name), z3.BitVec(f"{name}_inp_next", ts.inputs[name].width))
+                       for name in ts.inputs]
+        all_to_next = cur_to_next + inp_to_next
         changed = True
         while changed:
             changed = False
@@ -549,8 +566,8 @@ class IC3:
                 s.add(ts.assumption_expr)
                 s.add(ts.comb_expr)
                 s.add(ts.trans_expr)
-                s.add(z3.substitute(ts.comb_expr, *cur_to_next))
-                s.add(z3.substitute(cand_expr, *cur_to_next))
+                s.add(z3.substitute(ts.comb_expr, *all_to_next))
+                s.add(z3.substitute(cand_expr, *all_to_next))
 
                 if s.check() == z3.unsat:
                     essential.pop(idx)
@@ -614,7 +631,10 @@ class IC3:
 
     def _propagate_all(self, k, frames, P, ts):
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
-        ts_cn = z3.substitute(ts.comb_expr, *cur_to_next)
+        inp_to_next = [(ts.get_inp(name), z3.BitVec(f"{name}_inp_next", ts.inputs[name].width))
+                       for name in ts.inputs]
+        all_to_next = cur_to_next + inp_to_next
+        ts_cn = z3.substitute(ts.comb_expr, *all_to_next)
 
         for _ in range(5):
             prog = False
@@ -638,7 +658,7 @@ class IC3:
 
                 to_propagate = []
                 for c in candidates:
-                    cn = z3.substitute(z3.Not(c), *cur_to_next)
+                    cn = z3.substitute(z3.Not(c), *all_to_next)
                     t = z3.Bool(f"p{fi}_{len(to_propagate)}")
                     s.assert_and_track(cn, t)
                     to_propagate.append((c, t))
@@ -663,7 +683,7 @@ class IC3:
                         cs.add(ts.comb_expr)
                         cs.add(ts.trans_expr)
                         cs.add(ts_cn)
-                        cs.add(z3.substitute(z3.Not(c), *cur_to_next))
+                        cs.add(z3.substitute(z3.Not(c), *all_to_next))
                         if cs.check() == z3.unsat:
                             self._add_clause(c, fi + 1, frames, ts)
                             prog = True

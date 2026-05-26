@@ -290,7 +290,6 @@ def preprocess(text: str) -> str:
 
     # Replace $isunknown with 1'b1
     text = re.sub(r'\$isunknown\s*\([^)]*\)', "1'b1", text)
-    text = re.sub(r'\$stable\s*\([^)]*\)', "1'b0", text)
 
     # Scan for `MACRO(...) calls and expand them
     result = []
