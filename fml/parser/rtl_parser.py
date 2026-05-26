@@ -233,8 +233,7 @@ class RTLParser:
                 self._process_parameter_declaration(member, ts)
             elif k == SyntaxKind.HierarchyInstantiation:
                 self._hier_flattener.flatten_instantiation(member, ts)
-            elif k == SyntaxKind.ModuleInstantiation:
-                pass
+
             elif k == SyntaxKind.TypedefDeclaration:
                 self._process_typedef(member, ts)
             elif k == SyntaxKind.NetDeclaration:
@@ -609,6 +608,14 @@ class RTLParser:
         elif k == SyntaxKind.ExpressionStatement:
             result = self._assign_targets(stmt.expr, ts)
             for target, expr in result.items():
+                if target in ts.state_vars:
+                    tw = ts.state_vars[target].width
+                    ew = expr.size()
+                    if tw != ew:
+                        if tw > ew:
+                            expr = z3.ZeroExt(tw - ew, expr)
+                        else:
+                            expr = z3.Extract(tw - 1, 0, expr)
                 ts.set_next_state(target, expr)
         elif k == SyntaxKind.SequentialBlockStatement:
             for item in stmt.items:

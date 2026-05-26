@@ -73,6 +73,14 @@ class TransitionSystem:
             self.signed_vars.add(name)
 
     def set_next_state(self, name: str, expr: z3.BitVecRef):
+        if name in self.state_vars:
+            tw = self.state_vars[name].width
+            ew = expr.size()
+            if tw != ew:
+                if tw > ew:
+                    expr = z3.ZeroExt(tw - ew, expr)
+                else:
+                    expr = z3.Extract(tw - 1, 0, expr)
         self._next_state_exprs[name] = expr
 
     def set_var_dims(self, name: str, dims: list[int]):

@@ -100,9 +100,10 @@ def _node_to_z3(self, node) -> z3.BitVecRef:
                         right_width = self._extract_width_from_node(selector.right)
                         if right_width is None or right_width <= 0:
                             right_width = 1
-                        base_z = _zext(result, w + right_width)
-                        shift = _zext(left_val, w)
-                        result = z3.Extract(right_width - 1, 0, z3.LShR(result, shift))
+                        max_w = max(result.size(), w + right_width, left_val.size(), w)
+                        base_z = _zext(result, max_w)
+                        shift = _zext(left_val, max_w)
+                        result = z3.Extract(right_width - 1, 0, z3.LShR(base_z, shift))
 
                 elif sk == SyntaxKind.BitSelect:
                     idx = self._node_to_z3(selector.expr)
@@ -113,8 +114,11 @@ def _node_to_z3(self, node) -> z3.BitVecRef:
                             offset = bit * ew
                             result = z3.Extract(offset + ew - 1, offset, result)
                         else:
-                            shift = _zext(idx, result.size())
-                            result = z3.Extract(ew - 1, 0, z3.LShR(result, shift * ew))
+                            shift_w = max(result.size(), idx.size())
+                            result_z = _zext(result, shift_w)
+                            shift = _zext(idx, shift_w)
+                            scaled = shift * ew if isinstance(ew, int) else shift
+                            result = z3.Extract(ew - 1, 0, z3.LShR(result_z, scaled))
                         dim_idx += 1
                     else:
                         if z3.is_bv_value(idx):
