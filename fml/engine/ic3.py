@@ -3,6 +3,14 @@ from heapq import heappush, heappop
 from ..ir.transition_system import TransitionSystem
 from .kind import check_kinduction
 from .bmc import bmc_incremental
+from .solver.sat_solver import z3_to_dimacs
+
+
+try:
+    from pysat.solvers import Solver as SATSolver
+    _HAVE_PYSAT = True
+except ImportError:
+    _HAVE_PYSAT = False
 
 
 class IC3:
@@ -12,6 +20,41 @@ class IC3:
         self.max_frames = max_frames
         self.max_blocking = max_blocking
         self.bmc_fallback_depth = bmc_fallback_depth or max_frames * 50
+
+    def _sat_check(self, expr):
+        """Z3 expr via PySAT. True/False/None."""
+        if not _HAVE_PYSAT:
+            return self._sat_check_z3(expr)
+        dimacs, n_vars, n_clauses = z3_to_dimacs(expr)
+        if n_vars == 0:
+            return n_clauses != 0
+        if not dimacs:
+            return self._sat_check_z3(expr)
+        try:
+            sat_solver = SATSolver(name="glucose4", bootstrap_with=dimacs, use_timer=True)
+            result = sat_solver.solve()
+            sat_solver.delete()
+            return result
+        except Exception:
+            return self._sat_check_z3(expr)
+
+    def _sat_check_z3(self, expr):
+        s = z3.Solver()
+        s.set("timeout", self.ts.timeout)
+        s.add(expr)
+        r = s.check()
+        if r == z3.sat: return True
+        if r == z3.unsat: return False
+        return None
+
+    def _sat_check_with_model(self, expr):
+        s = z3.Solver()
+        s.set("timeout", self.ts.timeout)
+        s.add(expr)
+        r = s.check()
+        if r == z3.sat:
+            return s.model()
+        return None
 
     def prove(self, verbose: bool = True) -> dict:
         ts = self.ts
@@ -57,6 +100,7 @@ class IC3:
         inp_to_next = [(ts.get_inp(name), z3.BitVec(f"{name}_inp_next", ts.inputs[name].width))
                        for name in ts.inputs]
         P_next = z3.substitute(P, *(cur_to_next + inp_to_next))
+        self._p_str = z3.simplify(P).sexpr() if not z3.is_true(P) and not z3.is_false(P) else str(P)
 
         # Base case: check if any initial state violates P
         s0 = z3.Solver()
@@ -146,10 +190,9 @@ class IC3:
         seq = 0
 
         p_var_strs = set()
-        p_str = z3.simplify(P).sexpr() if not z3.is_true(P) and not z3.is_false(P) else str(P)
         for name in ts.state_vars:
             cur_str = f"__{name}__cur"
-            if cur_str in p_str:
+            if cur_str in self._p_str:
                 p_var_strs.add(cur_str)
 
         cex_next = {}
@@ -260,22 +303,22 @@ class IC3:
             if heap:
                 i, _, cube = heappop(heap)
             else:
-                s = z3.Solver()
-                s.set("timeout", ts.timeout)
-                for clause in frames[k - 1]:
-                    s.add(clause)
-                s.add(P)
-                s.add(ts.comb_expr)
-                s.add(ts.trans_expr)
-                s.add(ts_cn)
-                s.add(z3.Not(P_next))
-
-                r = s.check()
-                if r == z3.unsat:
+                cti_parts = list(frames[k - 1]) + [P, ts.comb_expr, ts.trans_expr, ts_cn, z3.Not(P_next)]
+                cti_query = z3.And(*cti_parts) if len(cti_parts) > 1 else cti_parts[0]
+                sat = self._sat_check(cti_query)
+                if sat is False:
                     if self._frames_equal(frames, k - 1, k):
                         return "proved"
                     return True
-                model = s.model()
+                if sat is None:
+                    if self._frames_equal(frames, k - 1, k):
+                        return "proved"
+                    return True
+                model = self._sat_check_with_model(cti_query)
+                if model is None:
+                    if self._frames_equal(frames, k - 1, k):
+                        return "proved"
+                    return True
                 cube = self._extract_cube(model, ts)
                 IC3._cube_objs[str(cube)] = cube
                 sig = _cti_signature(cube)
@@ -363,27 +406,24 @@ class IC3:
         inp_to_next = [(ts.get_inp(name), z3.BitVec(f"{name}_inp_next", ts.inputs[name].width))
                        for name in ts.inputs]
         all_to_next = cur_to_next + inp_to_next
-        s = z3.Solver()
-        s.set("timeout", ts.timeout if 'ts' in dir() else self.ts.timeout)
+        parts = []
         if i == 0:
-            s.add(ts.init_expr)
+            parts.append(ts.init_expr)
         else:
-            for clause in frames[i - 1]:
-                s.add(clause)
-            s.add(P)
-
-        s.add(ts.assumption_expr)
-        s.add(ts.comb_expr)
-        s.add(ts.trans_expr)
-        s.add(z3.substitute(ts.comb_expr, *all_to_next))
-        s.add(z3.substitute(cube, *all_to_next))
-
-        r = s.check()
-        if r == z3.unsat:
+            parts.append(z3.And(*frames[i - 1]))
+            parts.append(P)
+        parts.append(ts.assumption_expr)
+        parts.append(ts.comb_expr)
+        parts.append(ts.trans_expr)
+        parts.append(z3.substitute(ts.comb_expr, *all_to_next))
+        parts.append(z3.substitute(cube, *all_to_next))
+        query = z3.And(*parts) if len(parts) > 1 else parts[0]
+        sat = self._sat_check(query)
+        if sat is False:
             return "unsat"
-        if r == z3.unknown:
+        if sat is None:
             return None
-        return s.model()
+        return self._sat_check_with_model(query)
 
     # ── Unsat-Core Generalization ─────────────────────────────────────────
 
@@ -435,10 +475,10 @@ class IC3:
         core_set = set(str(t) for t in core)
 
         p_var_strs = set()
-        p_str = z3.simplify(P).sexpr() if not z3.is_true(P) and not z3.is_false(P) else str(P)
+
         for name in ts.state_vars:
             cur_str = f"__{name}__cur"
-            if cur_str in p_str:
+            if cur_str in self._p_str:
                 p_var_strs.add(cur_str)
 
         essential = []
@@ -484,10 +524,10 @@ class IC3:
         """If clause doesn't mention any property variable, try to find a
         single-literal clause that does, so it blocks cubes more broadly."""
         p_var_strs = set()
-        p_str = z3.simplify(P).sexpr() if not z3.is_true(P) and not z3.is_false(P) else str(P)
+
         for name in ts.state_vars:
             cur_str = f"__{name}__cur"
-            if cur_str in p_str:
+            if cur_str in self._p_str:
                 p_var_strs.add(cur_str)
 
         if not p_var_strs:
@@ -528,10 +568,10 @@ class IC3:
 
     def _minimize_core(self, essential, i, frames, P, ts):
         p_var_strs = set()
-        p_str = z3.simplify(P).sexpr() if not z3.is_true(P) and not z3.is_false(P) else str(P)
+
         for name in ts.state_vars:
             cur_str = f"__{name}__cur"
-            if cur_str in p_str:
+            if cur_str in self._p_str:
                 p_var_strs.add(cur_str)
 
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
@@ -552,21 +592,21 @@ class IC3:
                     continue
                 cand_expr = z3.And(*candidate) if len(candidate) > 1 else candidate[0]
 
-                s = z3.Solver()
-                s.set("timeout", 200)
+                parts = []
                 if i == 0:
-                    s.add(ts.init_expr)
+                    parts.append(ts.init_expr)
                 else:
-                    for clause in frames[i - 1]:
-                        s.add(clause)
-                    s.add(P)
-                s.add(ts.assumption_expr)
-                s.add(ts.comb_expr)
-                s.add(ts.trans_expr)
-                s.add(z3.substitute(ts.comb_expr, *all_to_next))
-                s.add(z3.substitute(cand_expr, *all_to_next))
-
-                if s.check() == z3.unsat:
+                    parts.append(z3.And(*frames[i - 1]))
+                    parts.append(P)
+                parts.append(ts.assumption_expr)
+                parts.append(ts.comb_expr)
+                parts.append(ts.trans_expr)
+                parts.append(z3.substitute(ts.comb_expr, *all_to_next))
+                parts.append(z3.substitute(cand_expr, *all_to_next))
+                query = z3.And(*parts) if len(parts) > 1 else parts[0]
+                if not self._sat_check(query):
+                    essential.pop(idx)
+                    changed = True
                     essential.pop(idx)
                     changed = True
         return essential
