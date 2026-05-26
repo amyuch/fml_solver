@@ -369,9 +369,16 @@ class IC3:
     def _extract_cube(self, model, ts) -> z3.BoolRef:
         parts = []
         for name in ts.state_vars:
-            val = model.eval(ts.get_cur(name))
-            parts.append(ts.get_cur(name) == val)
-        return z3.And(*parts)
+            try:
+                val = model.eval(ts.get_cur(name))
+                val_str = str(val)
+                cur_str = str(ts.get_cur(name))
+                if val_str == cur_str:
+                    continue
+                parts.append(ts.get_cur(name) == val)
+            except Exception:
+                continue
+        return z3.And(*parts) if parts else z3.BoolVal(True)
 
     def _is_blocked(self, cube, i, frames, ts) -> bool:
         if i < 0 or i >= len(frames):
@@ -439,6 +446,13 @@ class IC3:
         if len(lits_cur) <= 1:
             return z3.Not(cube)
 
+        p_var_strs = set()
+        for name in ts.state_vars:
+            cur_str = f"__{name}__cur"
+            if cur_str in self._p_str:
+                p_var_strs.add(cur_str)
+        lits_cur.sort(key=lambda x: 0 if any(pv in str(x) for pv in p_var_strs) else 1)
+
         cur_to_next = [(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
         inp_to_next = [(ts.get_inp(name), z3.BitVec(f"{name}_inp_next", ts.inputs[name].width))
                        for name in ts.inputs]
@@ -473,13 +487,6 @@ class IC3:
 
         core = s.unsat_core()
         core_set = set(str(t) for t in core)
-
-        p_var_strs = set()
-
-        for name in ts.state_vars:
-            cur_str = f"__{name}__cur"
-            if cur_str in self._p_str:
-                p_var_strs.add(cur_str)
 
         essential = []
         has_prop_var = False
