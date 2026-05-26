@@ -998,7 +998,7 @@ class RTLParser:
             clock = self._extract_clock(ps.clocking)
 
         if hasattr(ps, 'expr') and ps.expr is not None:
-            result = self._property_to_z3(ps.expr, clock, ts)
+            result = self._property_to_z3(ps.expr, clock, ts, directive)
             if result is not None:
                 if directive == "assume":
                     prefix = f"assume_{len(ts.assumptions)}"
@@ -1010,12 +1010,13 @@ class RTLParser:
                     prefix = f"assert_{len(ts.properties)}"
                     ts.add_property(prefix, result)
 
-    def _property_to_z3(self, node, clock: str | None, ts: TransitionSystem) -> z3.BoolRef | None:
+    def _property_to_z3(self, node, clock: str | None, ts: TransitionSystem,
+                        directive: str = "assert") -> z3.BoolRef | None:
         k = node.kind
 
         if k == SyntaxKind.ImplicationPropertyExpr:
-            ant = self._property_to_z3(node.left, clock, ts)
-            cons = self._property_to_z3(node.right, clock, ts)
+            ant = self._property_to_z3(node.left, clock, ts, directive)
+            cons = self._property_to_z3(node.right, clock, ts, directive)
             if ant is None or cons is None:
                 return None
             op_text = str(node.op.rawText) if hasattr(node.op, 'rawText') else "|->"
@@ -1025,21 +1026,228 @@ class RTLParser:
                     *[(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
                 )
                 tp_expr = z3.Implies(ant, cons_next)
-                ts.add_trans_property(f"assert_{len(ts.trans_properties)}", tp_expr)
+                if directive == "assume":
+                    ts.add_assumption(tp_expr)
+                else:
+                    ts.add_trans_property(f"{directive}_{len(ts.trans_properties)}", tp_expr)
                 return None
             else:
-                ts.add_property(f"assert_{len(ts.properties)}", z3.Implies(ant, cons))
+                imp_expr = z3.Implies(ant, cons)
+                if directive == "assume":
+                    ts.add_assumption(imp_expr)
+                else:
+                    ts.add_property(f"{directive}_{len(ts.properties)}", imp_expr)
                 return None
 
         if k in (SyntaxKind.ParenthesizedPropertyExpr, SyntaxKind.SimplePropertyExpr, SyntaxKind.SimpleSequenceExpr):
             if hasattr(node, 'expr'):
-                return self._property_to_z3(node.expr, clock, ts)
+                return self._property_to_z3(node.expr, clock, ts, directive)
             return None
 
         if k == SyntaxKind.ClockingPropertyExpr:
             if hasattr(node, 'expr'):
-                return self._property_to_z3(node.expr, clock, ts)
+                return self._property_to_z3(node.expr, clock, ts, directive)
             return None
+
+        if k == SyntaxKind.ClockingSequenceExpr:
+            if hasattr(node, 'expr'):
+                return self._property_to_z3(node.expr, clock, ts, directive)
+            return None
+
+        if k == SyntaxKind.ParenthesizedSequenceExpr:
+            if hasattr(node, 'expr'):
+                return self._property_to_z3(node.expr, clock, ts, directive)
+            return None
+
+        if k == SyntaxKind.UnaryPropertyExpr:
+            inner = None
+            keyword = None
+            for child in node:
+                if hasattr(child, 'kind'):
+                    ck = str(child.kind)
+                    if 'NotKeyword' in ck:
+                        keyword = 'not'
+                    elif 'AlwaysKeyword' in ck:
+                        keyword = 'always'
+                    elif 'SEventuallyKeyword' in ck:
+                        keyword = 's_eventually'
+                    elif 'SNexttimeKeyword' in ck:
+                        keyword = 's_nexttime'
+                    else:
+                        inner = self._property_to_z3(child, clock, ts, directive)
+            if inner is None:
+                return None
+            if keyword == 'not':
+                return z3.Not(inner)
+            if keyword == 's_eventually':
+                return inner
+            if keyword == 'always':
+                return inner
+            return inner
+
+        if k == SyntaxKind.AndSequenceExpr:
+            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(children) >= 2:
+                l = self._property_to_z3(children[0], clock, ts, directive)
+                r = self._property_to_z3(children[1], clock, ts, directive)
+                if l is not None and r is not None:
+                    return z3.And(l, r)
+            return None
+
+        if k == SyntaxKind.OrSequenceExpr:
+            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(children) >= 2:
+                l = self._property_to_z3(children[0], clock, ts, directive)
+                r = self._property_to_z3(children[1], clock, ts, directive)
+                if l is not None and r is not None:
+                    return z3.Or(l, r)
+            return None
+
+        if k == SyntaxKind.IntersectSequenceExpr:
+            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(children) >= 2:
+                l = self._property_to_z3(children[0], clock, ts, directive)
+                r = self._property_to_z3(children[1], clock, ts, directive)
+                if l is not None and r is not None:
+                    return z3.And(l, r)
+            return None
+
+        if k == SyntaxKind.IffPropertyExpr:
+            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(children) >= 2:
+                l = self._property_to_z3(children[0], clock, ts, directive)
+                r = self._property_to_z3(children[1], clock, ts, directive)
+                if l is not None and r is not None:
+                    return (l == r)
+            return None
+
+        if k == SyntaxKind.SUntilPropertyExpr:
+            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(children) >= 2:
+                l = self._property_to_z3(children[0], clock, ts, directive)
+                r = self._property_to_z3(children[1], clock, ts, directive)
+                if l is not None and r is not None:
+                    return z3.Or(r, l)
+            return None
+
+        if k == SyntaxKind.UntilPropertyExpr:
+            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(children) >= 2:
+                l = self._property_to_z3(children[0], clock, ts, directive)
+                r = self._property_to_z3(children[1], clock, ts, directive)
+                if l is not None and r is not None:
+                    return z3.Or(r, l)
+            return None
+
+        if k == SyntaxKind.SUntilWithPropertyExpr:
+            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(children) >= 2:
+                l = self._property_to_z3(children[0], clock, ts, directive)
+                r = self._property_to_z3(children[1], clock, ts, directive)
+                if l is not None and r is not None:
+                    return z3.Or(r, l)
+            return None
+
+        if k == SyntaxKind.UntilWithPropertyExpr:
+            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(children) >= 2:
+                l = self._property_to_z3(children[0], clock, ts, directive)
+                r = self._property_to_z3(children[1], clock, ts, directive)
+                if l is not None and r is not None:
+                    return z3.Or(r, l)
+            return None
+
+        if k == SyntaxKind.ConditionalPropertyExpr:
+            ant = None
+            cons = None
+            cond = None
+            items = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(items) >= 3:
+                cond = self._property_to_z3(items[0], clock, ts, directive)
+                ant = self._property_to_z3(items[1], clock, ts, directive)
+                cons = self._property_to_z3(items[2], clock, ts, directive)
+            elif len(items) >= 2:
+                cond = items[0]
+                ant = self._property_to_z3(items[0] if cond else items[1], clock, ts, directive)
+                cons = self._property_to_z3(items[1] if cond else items[0], clock, ts, directive)
+            if cond is not None and ant is not None and cons is not None:
+                return z3.Or(z3.Not(cond), z3.And(ant, cons))
+            if ant is not None and cons is not None:
+                return z3.And(ant, cons)
+            return ant if ant is not None else cons
+
+        if k == SyntaxKind.DelayedSequenceExpr:
+            children = [c for c in node if hasattr(c, 'kind')]
+            if len(children) >= 2:
+                left_seq = children[0]
+                delay_elem = children[1]
+                left_expr = self._property_to_z3(left_seq, clock, ts, directive)
+                if left_expr is None:
+                    return None
+                delay_cycles = 1
+                right_seq = None
+                for dc in delay_elem:
+                    if hasattr(dc, 'kind'):
+                        dk = str(dc.kind)
+                        if 'IntegerLiteral' in dk or 'Litera' in dk:
+                            try:
+                                delay_cycles = int(self._token_text(dc), 0)
+                            except:
+                                pass
+                        elif 'RangeSelect' in dk or dk == 'SimpleRangeSelect':
+                            delay_left = self._eval_literal_expr(dc.left)
+                            if delay_left is not None:
+                                delay_cycles = delay_left
+                        elif 'SimpleSequenceExpr' in dk or 'SimplePropertyExpr' in dk:
+                            right_seq = dc
+                if right_seq is None:
+                    for dc in delay_elem:
+                        if hasattr(dc, 'kind') and 'SimpleSequence' in str(dc.kind):
+                            right_seq = dc
+                            break
+                if right_seq is None:
+                    return left_expr
+                right_expr = self._property_to_z3(right_seq, clock, ts, directive)
+                if right_expr is None:
+                    return None
+                if delay_cycles == 0:
+                    return z3.And(left_expr, right_expr)
+                for _ in range(delay_cycles):
+                    right_expr = z3.substitute(
+                        right_expr,
+                        *[(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
+                    )
+                return z3.And(left_expr, right_expr)
+            return None
+
+        if k == SyntaxKind.SequenceRepetition:
+            rep_count = 1
+            is_plus = False
+            inner_seq = None
+            for child in node:
+                if hasattr(child, 'kind'):
+                    ck = str(child.kind)
+                    if 'Plus' in ck:
+                        is_plus = True
+                    elif 'Star' in ck:
+                        pass
+                    elif 'BitSelect' in ck:
+                        for sc in child:
+                            if hasattr(sc, 'kind') and 'IntegerLiteral' in str(sc.kind):
+                                try:
+                                    rep_count = int(self._token_text(sc), 0)
+                                except:
+                                    pass
+                    elif 'SimpleSequence' in ck or 'SimpleProperty' in ck:
+                        inner_seq = child
+            if inner_seq is None:
+                return None
+            inner_expr = self._property_to_z3(inner_seq, clock, ts, directive)
+            if inner_expr is None:
+                return None
+            if is_plus:
+                return inner_expr
+            return inner_expr
 
         prop_bv = self._node_to_z3(node)
         if prop_bv is not None:
@@ -1088,10 +1296,26 @@ class RTLParser:
             return self._expr_width(node.expr, ts) if hasattr(node, 'expr') else 1
         if k == SyntaxKind.SimpleSequenceExpr:
             return self._expr_width(node.expr, ts) if hasattr(node, 'expr') else 1
+        if k in (SyntaxKind.AndSequenceExpr, SyntaxKind.OrSequenceExpr,
+                 SyntaxKind.IntersectSequenceExpr):
+            return 1
+        if k == SyntaxKind.IffPropertyExpr:
+            return 1
+        if k in (SyntaxKind.SUntilPropertyExpr, SyntaxKind.UntilPropertyExpr,
+                 SyntaxKind.SUntilWithPropertyExpr, SyntaxKind.UntilWithPropertyExpr):
+            return 1
+        if k == SyntaxKind.UnaryPropertyExpr:
+            return 1
+        if k == SyntaxKind.DelayedSequenceExpr:
+            return 1
+        if k == SyntaxKind.SequenceRepetition:
+            return 1
         if k == SyntaxKind.InvocationExpression:
             if hasattr(node, 'left') and hasattr(node.left, 'systemIdentifier'):
                 func_name = node.left.systemIdentifier.valueText
-                if func_name in ('$rose', '$fell', '$stable'):
+                if func_name in ('$rose', '$fell', '$stable', '$changed'):
+                    return 1
+                if func_name == '$isunknown':
                     return 1
                 if func_name == '$past':
                     args = self._extract_call_args(node)
@@ -1397,6 +1621,24 @@ class RTLParser:
                 return self._node_to_z3(node.expr)
             return z3.BitVecVal(0, 1)
 
+        if k == SyntaxKind.AndSequenceExpr:
+            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(children) >= 2:
+                l = self._node_to_z3(children[0])
+                r = self._node_to_z3(children[1])
+                l, r = self._z3_promote_pair(l, r)
+                return z3.If(z3.And(l != 0, r != 0), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
+            return z3.BitVecVal(0, 1)
+
+        if k == SyntaxKind.OrSequenceExpr:
+            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(children) >= 2:
+                l = self._node_to_z3(children[0])
+                r = self._node_to_z3(children[1])
+                l, r = self._z3_promote_pair(l, r)
+                return z3.If(z3.Or(l != 0, r != 0), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
+            return z3.BitVecVal(0, 1)
+
         if k == SyntaxKind.InvocationExpression:
             if hasattr(node, 'left') and hasattr(node.left, 'systemIdentifier'):
                 func_name = node.left.systemIdentifier.valueText
@@ -1469,7 +1711,7 @@ class RTLParser:
     def _process_system_func(self, func_name: str, args: list) -> z3.BitVecRef:
         ts = self._current_ts
 
-        if func_name in ('rose', 'fell', 'stable'):
+        if func_name in ('rose', 'fell', 'stable', 'changed'):
             if not args:
                 return z3.BitVecVal(0, 1)
             arg_node = args[0]
@@ -1492,6 +1734,12 @@ class RTLParser:
             elif func_name == 'stable':
                 return z3.If(arg_expr == past_val,
                              z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
+            elif func_name == 'changed':
+                return z3.If(arg_expr != past_val,
+                             z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
+            return z3.BitVecVal(0, 1)
+
+        if func_name == 'isunknown':
             return z3.BitVecVal(0, 1)
 
         if func_name == 'past':

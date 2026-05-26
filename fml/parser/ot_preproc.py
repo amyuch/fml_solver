@@ -19,14 +19,16 @@ def _find_matching_paren(text, start):
             depth -= 1
             if depth == 0:
                 return i
-        elif text[i] == '"' or text[i] == "'":
-            # Skip string literals
-            quote = text[i]
+        elif text[i] == '"':
+            # Skip double-quoted string literals
             i += 1
-            while i < len(text) and text[i] != quote:
+            while i < len(text) and text[i] != '"':
                 if text[i] == '\\':
                     i += 1
                 i += 1
+        elif text[i] == "'" and i + 2 < len(text) and text[i + 2] == "'":
+            # Skip single-character SV literal like 'a'
+            i += 2
         i += 1
     return -1
 
@@ -51,9 +53,9 @@ def _split_macro_args(s):
             if c == str_char:
                 in_str = False
             current.append(c)
-        elif c in ('"', "'"):
+        elif c == '"':
             in_str = True
-            str_char = c
+            str_char = '"'
             current.append(c)
         elif c == '(':
             depth_paren += 1
