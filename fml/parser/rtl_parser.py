@@ -16,6 +16,7 @@ from .node_to_z3 import (
     _node_to_z3, _z3_promote_pair, _z3_promote,
     _extract_call_args, _unwrap_property_wrapper, _process_system_func,
 )
+from .hier_flatten import HierarchyFlattener
 
 def _z3_slt(a, b):
     ctx = a.ctx
@@ -55,6 +56,7 @@ class RTLParser:
         self.driver = Driver()
         self.driver.addStandardArgs()
         self._past_counter = 0
+        self._hier_flattener = HierarchyFlattener()
 
     def parse_file(self, filepath: str) -> list[TransitionSystem]:
         self._module_path = filepath
@@ -230,8 +232,9 @@ class RTLParser:
             elif k == SyntaxKind.ParameterDeclarationStatement:
                 self._process_parameter_declaration(member, ts)
             elif k == SyntaxKind.HierarchyInstantiation:
+                self._hier_flattener.flatten_instantiation(member, ts)
+            elif k == SyntaxKind.ModuleInstantiation:
                 pass
-
             elif k == SyntaxKind.TypedefDeclaration:
                 self._process_typedef(member, ts)
             elif k == SyntaxKind.NetDeclaration:
@@ -390,7 +393,7 @@ class RTLParser:
         elif k == SyntaxKind.ParameterDeclarationStatement:
             self._process_parameter_declaration(node, ts)
         elif k == SyntaxKind.HierarchyInstantiation:
-            pass
+            self._hier_flattener.flatten_instantiation(node, ts)
         elif k == SyntaxKind.ModuleInstantiation:
             pass
         else:
@@ -787,6 +790,38 @@ class RTLParser:
                     continue
                 item_assignments = self._collect_comb_assignments(item, ts, result)
                 result.update(item_assignments)
+            return result
+        if k == SyntaxKind.ForLoopStatement:
+            result = dict(prior)
+            # Evaluate loop bounds
+            init_val = None
+            bound_val = None
+            step = 1
+            for child in stmt:
+                if hasattr(child, 'kind') and not isinstance(child.kind, int):
+                    if child.kind.name == 'ForVariableDeclaration':
+                        decls = child.declarators if hasattr(child, 'declarators') else [child.declarator] if hasattr(child, 'declarator') else []
+                        for d in decls:
+                            if hasattr(d, 'initializer') and d.initializer is not None:
+                                init_val = self._eval_literal_expr(d.initializer.expr, ts)
+                            if hasattr(d, 'initializer') and d.initializer is not None:
+                                init_val = self._eval_literal_expr(d.initializer.expr, ts)
+                    elif child.kind.name == 'LessThanExpression' or child.kind.name == 'LessThanEqualExpression':
+                        bound_val = self._eval_literal_expr(child.right, ts)
+                        if child.kind.name == 'LessThanEqualExpression' and bound_val is not None:
+                            bound_val += 1
+                    elif child.kind.name == 'PostincrementExpression' or child.kind.name == 'PreincrementExpression':
+                        step = 1
+                    elif child.kind.name == 'PostdecrementExpression' or child.kind.name == 'PredecrementExpression':
+                        step = -1
+                    elif child.kind == SyntaxKind.SequentialBlockStatement:
+                        loop_body = child
+            if init_val is not None and bound_val is not None and step != 0:
+                for i in range(init_val, bound_val, step):
+                    self._genvar_subst = {'i': i}
+                    body_result = self._collect_comb_assignments(loop_body, ts, result)
+                    result.update(body_result)
+                self._genvar_subst = None
             return result
         return {}
 
