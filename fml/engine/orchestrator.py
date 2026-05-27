@@ -5,8 +5,10 @@ from ..ir.transition_system import TransitionSystem
 from .bmc import bmc_incremental
 from .kind import check_kinduction
 from .ic3 import IC3
+from .sat_ic3 import SATIC3
 from .simulation import simulation_falsify, simulation_cover
 from .analysis.fan_in import compute_fanin_cone, summarize_cone
+from .analysis.metrics import MetricsReport
 from .solver.abc_bridge import ts_verify_via_abc
 from .cover import cover_bmc
 
@@ -23,6 +25,7 @@ class VerificationResult:
         self.reason = None
         self.time_taken = 0.0
         self.engines_tried = []
+        self.metrics = None
 
     def to_dict(self):
         d = {
@@ -39,6 +42,8 @@ class VerificationResult:
             d["counterexample"] = self.counterexample
         if self.reason:
             d["reason"] = self.reason
+        if self.metrics:
+            d["metrics"] = self.metrics
         return d
 
 
@@ -72,16 +77,19 @@ class EngineOrchestrator:
         if ptype == "cover_properties":
             return self._handle_cover(pname, p_expr, res)
 
+        if ptype == "trans_properties":
+            return self._verify_trans_property(pname, p_expr, res, max_kind)
+
         # Phase 0: Fan-in cone analysis
         fanin_state, fanin_inputs = compute_fanin_cone(self.ts, p_expr)
         if self.verbose:
             print(summarize_cone(self.ts, p_expr))
 
-        # Phase 1: Quick falsification via random simulation
+        # Phase 1: Quick falsification via random simulation (optional)
         start = time.time()
         if self.verbose:
             print(f"  [{pname}] Phase 1: Random simulation...")
-        cex = simulation_falsify(self.ts, max_cycles=200, trials=3, verbose=self.verbose)
+        cex = simulation_falsify(self.ts, max_cycles=200, trials=2, verbose=self.verbose)
         res.engines_tried.append("simulation")
         if cex:
             elapsed = time.time() - start
@@ -101,9 +109,14 @@ class EngineOrchestrator:
                                           max_bmc, max_kind, res, start,
                                           fanin_state)
 
-        return self._verify_sequential(pname, p_expr, ptype, timeout,
-                                        max_bmc, max_kind, res, start,
-                                        fanin_state)
+        res = self._verify_sequential(pname, p_expr, ptype, timeout,
+                                       max_bmc, max_kind, res, start,
+                                       fanin_state)
+
+        # Phase 3: Metrics (always collected, appended to result)
+        metrics = MetricsReport(self.ts)
+        res.metrics = metrics.compute(p_expr)
+        return res
 
     def _verify_sequential(self, pname, p_expr, ptype, timeout,
                             max_bmc, max_kind, res, start, fanin_state):
@@ -160,15 +173,28 @@ class EngineOrchestrator:
         res.time_taken = time.time() - start
         return res
 
+    def _run_bmc_single(self, pname, p_expr, max_bmc):
+        from .bmc import _bmc_check_one
+        is_trans = False
+        for pn, _ in self.ts.trans_properties:
+            if pn == pname:
+                is_trans = True
+                break
+        for k in range(max_bmc + 1):
+            r = _bmc_check_one(self.ts, pname, p_expr, k, is_trans=is_trans)
+            if r is not None:
+                return r
+        return {"result": "pass", "bound": max_bmc}
+
     def _select_strategy(self, prop_type):
         if prop_type == "deep_state":
-            return ["kind", "abc", "bmc", "ic3"]
+            return ["sat_ic3", "ic3", "bmc"]
         elif prop_type == "datapath":
-            return ["abc", "bmc", "ic3", "kind"]
+            return ["sat_ic3", "bmc", "ic3"]
         elif prop_type == "control":
-            return ["ic3", "abc", "bmc", "kind"]
+            return ["sat_ic3", "ic3", "bmc"]
         else:
-            return ["abc", "bmc", "ic3", "kind"]
+            return ["sat_ic3", "ic3", "bmc"]
 
     def _run_single_engine(self, engine_name, pname, timeout,
                             max_bmc, max_kind, res, start):
@@ -181,15 +207,25 @@ class EngineOrchestrator:
 
         res.engines_tried.append(engine_name)
 
+        ts = self.ts
+        p_expr = None
+        for plist_name in ["properties", "trans_properties", "cover_properties"]:
+            plist = getattr(ts, plist_name, [])
+            for pn, pe in plist:
+                if pn == pname:
+                    p_expr = pe
+                    break
+
         if engine_name == "bmc":
-            engine_res = bmc_incremental(self.ts, max_bmc, verbose=self.verbose)
-        elif engine_name == "kind":
-            engine_res = check_kinduction(self.ts, max_kind, verbose=self.verbose)
+            engine_res = self._run_bmc_single(pname, p_expr, max_bmc)
         elif engine_name == "ic3":
-            ic3 = IC3(self.ts)
-            engine_res = ic3.prove(verbose=self.verbose)
+            ic3 = IC3(ts)
+            engine_res = ic3._prove_property(p_expr, pname, verbose=self.verbose)
+        elif engine_name == "sat_ic3":
+            sat = SATIC3(ts)
+            engine_res = sat._prove_property(p_expr, pname, verbose=self.verbose)
         elif engine_name == "abc":
-            engine_res = ts_verify_via_abc(self.ts, timeout=int(elapsed_budget))
+            engine_res = ts_verify_via_abc(ts, timeout=int(elapsed_budget))
         else:
             return None
 
@@ -305,6 +341,34 @@ class EngineOrchestrator:
             return "deep_state"
         return "mixed"
 
+    def _verify_trans_property(self, pname, p_expr, res, max_kind):
+        from .kind import kind_check_one
+        start = time.time()
+        res.engines_tried.append("kinduction")
+        kind_res = kind_check_one(self.ts, pname, p_expr, max_kind, is_trans=True,
+                                   timeout=self.ts.timeout)
+        elapsed = time.time() - start
+
+        if kind_res.get("result") == "proved":
+            res.result = "proved"
+            res.engine = "kinduction"
+            res.bound = kind_res.get("bound")
+            res.time_taken = elapsed
+            return res
+
+        if kind_res.get("result") == "fail":
+            res.result = "fail"
+            res.engine = "kinduction"
+            res.bound = kind_res.get("bound")
+            res.time_taken = elapsed
+            return res
+
+        res.result = "unknown"
+        res.engine = "kinduction"
+        res.reason = "k-induction incomplete"
+        res.time_taken = elapsed
+        return res
+
     def _handle_cover(self, pname, p_expr, res):
         start = time.time()
 
@@ -369,4 +433,13 @@ def format_orchestrator_results(results, verbose=False):
             lines.append(f"     engines tried: {', '.join(res.engines_tried)}")
         if verbose and res.bound is not None:
             lines.append(f"     bound: {res.bound}")
+        if verbose and res.metrics:
+            m = res.metrics
+            coi = m.get("coi", {})
+            lines.append(f"     COI: {coi.get('n_state_vars', '?')} state vars, {coi.get('n_inputs', '?')} inputs")
+            vac = m.get("vacuity", {})
+            if vac.get("vacuous"):
+                lines.append(f"     VACUOUS: {vac.get('reason', '')}")
+            cov = m.get("coverage", {})
+            lines.append(f"     Coverage: {cov.get('coverage_pct', 0):.0f}%")
     return "\n".join(lines)

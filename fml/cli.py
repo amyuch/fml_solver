@@ -8,6 +8,7 @@ from fml.engine.ic3 import IC3
 from fml.engine.orchestrator import EngineOrchestrator, format_orchestrator_results
 from fml.engine.simulation import simulation_falsify
 from fml.engine.analysis.fan_in import compute_fanin_cone, summarize_cone
+from fml.engine.analysis.metrics import MetricsReport
 from fml.engine.solver.abc_bridge import ts_verify_via_abc
 from fml.engine.cover import cover_bmc
 
@@ -28,6 +29,8 @@ def main():
     parser.add_argument("--abc", action="store_true", help="Run ABC PDR (yosys + ABC pipeline) only")
     parser.add_argument("--cover", action="store_true", help="Run cover property analysis")
     parser.add_argument("--fanin", action="store_true", help="Show fan-in cone analysis")
+    parser.add_argument("--metrics", action="store_true", help="Show property metrics (COI, vacuity, coverage, complexity)")
+    parser.add_argument("--mutation", action="store_true", help="Run mutation testing on properties")
     parser.add_argument("--text", "-t", help="Inline SystemVerilog text")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--max-bmc", type=int, default=100, help="Max BMC bound")
@@ -67,6 +70,28 @@ endmodule
         for pname, p_expr in sys.trans_properties:
             print(f"\nTrans Property: {pname}")
             print(summarize_cone(sys, p_expr))
+        return
+
+    if args.metrics:
+        print(f"\n>>> Property Metrics...")
+        metrics = MetricsReport(sys)
+        for pname, p_expr in sys.properties:
+            print(f"\n{'─' * 50}")
+            print(f"  Property: {pname}")
+            print(f"{'─' * 50}")
+            m = metrics.compute(p_expr)
+            _print_metrics(pname, m)
+        for pname, p_expr in sys.trans_properties:
+            print(f"\n{'─' * 50}")
+            print(f"  Trans Property: {pname}")
+            print(f"{'─' * 50}")
+            m = metrics.compute(p_expr)
+            _print_metrics(pname, m)
+        return
+
+    if args.mutation:
+        print(f"\n>>> Mutation Testing...")
+        _run_mutation_tests(sys, verbose=args.verbose)
         return
 
     if args.sim:
@@ -163,6 +188,52 @@ def _print_result(result: dict):
         print(f"  V All properties: PASS up to bound {result.get('bound', '?')}")
     else:
         print(f"  ? {result.get('property', '?')}: {result.get('reason', 'unknown')}")
+
+
+def _print_metrics(pname, m):
+    coi = m.get("coi", {})
+    vac = m.get("vacuity", {})
+    cov = m.get("coverage", {})
+    cpx = m.get("complexity", {})
+
+    print(f"    COI: {coi.get('n_state_vars', '?')}/{coi.get('n_state_total', '?')} state vars"
+          f" ({coi.get('state_pruned_pct', 0):.0f}% pruned),"
+          f" {coi.get('n_inputs', '?')}/{coi.get('n_input_total', '?')} inputs"
+          f" ({coi.get('input_pruned_pct', 0):.0f}% pruned)")
+    print(f"    Total signal bits in cone: {coi.get('total_signal_bits', '?')}")
+    if coi.get("direct_state_vars"):
+        print(f"    Direct state refs: {', '.join(coi['direct_state_vars'][:6])}"
+              f"{'...' if len(coi['direct_state_vars']) > 6 else ''}")
+    if coi.get("direct_inputs"):
+        print(f"    Direct input refs: {', '.join(coi['direct_inputs'][:6])}"
+              f"{'...' if len(coi['direct_inputs']) > 6 else ''}")
+
+    vac_str = vac.get("reason", "?")
+    if vac.get("vacuous") is True:
+        vac_str = f"VACUOUS ({vac_str})"
+    elif vac.get("vacuous") is False:
+        vac_str = f"non-vacuous"
+    print(f"    Vacuity: {vac_str}")
+
+    print(f"    Coverage: {cov.get('coverage_pct', 0):.0f}% ({cov.get('exercised', 0)}/{cov.get('trials', 0)} trials)")
+    print(f"    Complexity: depth={cpx.get('ast_depth', '?')}, "
+          f"nodes={cpx.get('node_count', '?')}, "
+          f"ops={', '.join(cpx.get('operators', [])[:8])}")
+
+
+def _run_mutation_tests(ts, verbose=False):
+    from fml.engine.analysis.metrics import MetricsReport
+    metrics = MetricsReport(ts)
+    for pname, p_expr in ts.properties:
+        print(f"\n  {pname}: running mutation tests...")
+        mr = metrics.mutation_test(p_expr, pname, max_mutations=12)
+        if mr.get("mutation_score") is not None:
+            print(f"    Mutation score: {mr['mutation_score']:.1%}"
+                  f" ({mr['mutations_caught']}/{mr['mutations_total']} caught)")
+            for m in mr.get("mutations", []):
+                print(f"      - {m['signal']}: {m['type']}")
+        else:
+            print(f"    {mr.get('reason', 'no result')}")
 
 
 if __name__ == "__main__":

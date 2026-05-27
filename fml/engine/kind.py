@@ -166,3 +166,68 @@ def check_kinduction(ts: TransitionSystem, k: int, verbose: bool = True) -> dict
     if not unproved:
         return {"result": "proved", "bound": max_k}
     return {"result": "unknown", "bound": max_k}
+
+
+def kind_check_one(ts, pname, p_expr, k, is_trans=False, timeout=30000):
+    """K-induction check for a single property. Returns 'proved' or 'unknown'."""
+    for kk in range(1, k + 1):
+        state_v = [ts.state_vector(f"_{i}") for i in range(kk + 3)]
+        inp_v = [ts.input_vector(f"_inp{i}") for i in range(kk + 3)]
+
+        base_s = z3.Solver()
+        base_s.set("timeout", timeout)
+        if not is_trans:
+            init_expr = _subst_state_inp(ts, ts.init_expr, state_v, inp_v, 0)
+            base_s.add(z3.simplify(init_expr))
+            _add_acts_per_state(base_s, ts, state_v, inp_v, kk + 1)
+            for i in range(kk):
+                trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
+                base_s.add(z3.simplify(trans_expr))
+            _add_comb_per_state(base_s, ts, state_v, inp_v, kk + 1)
+            viol = []
+            for i in range(kk + 1):
+                viol.append(z3.simplify(z3.Not(_subst_state_inp(ts, p_expr, state_v, inp_v, i))))
+            base_s.add(z3.Or(*viol))
+        else:
+            init_expr = _subst_state(ts, ts.init_expr, state_v, 0)
+            base_s.add(z3.simplify(init_expr))
+            _add_acts_per_state(base_s, ts, state_v, inp_v, kk + 2)
+            for i in range(kk):
+                trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
+                base_s.add(z3.simplify(trans_expr))
+            _add_comb_per_state(base_s, ts, state_v, inp_v, kk + 1)
+            viol = []
+            for i in range(kk):
+                viol.append(z3.simplify(z3.Not(_subst_trans(ts, p_expr, state_v, inp_v, i))))
+            base_s.add(z3.Or(*viol))
+
+        result = base_s.check()
+        if result == z3.sat:
+            return {"result": "fail", "property": pname, "stage": "base", "bound": kk}
+
+        ind_s = z3.Solver()
+        ind_s.set("timeout", timeout)
+        if not is_trans:
+            for i in range(kk + 1):
+                ind_s.add(z3.simplify(_subst_state_inp(ts, p_expr, state_v, inp_v, i)))
+            _add_acts_per_state(ind_s, ts, state_v, inp_v, kk + 2)
+            for i in range(kk + 1):
+                trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
+                ind_s.add(z3.simplify(trans_expr))
+            _add_comb_per_state(ind_s, ts, state_v, inp_v, kk + 2)
+            ind_s.add(z3.simplify(z3.Not(_subst_state_inp(ts, p_expr, state_v, inp_v, kk + 1))))
+        else:
+            for i in range(kk + 1):
+                ind_s.add(z3.simplify(_subst_trans(ts, p_expr, state_v, inp_v, i)))
+            _add_acts_per_state(ind_s, ts, state_v, inp_v, kk + 3)
+            for i in range(kk + 2):
+                trans_expr = _subst_trans(ts, ts.trans_expr, state_v, inp_v, i)
+                ind_s.add(z3.simplify(trans_expr))
+            _add_comb_per_state(ind_s, ts, state_v, inp_v, kk + 3)
+            ind_s.add(z3.simplify(z3.Not(_subst_trans(ts, p_expr, state_v, inp_v, kk + 1))))
+
+        ind_result = ind_s.check()
+        if ind_result == z3.unsat:
+            return {"result": "proved", "property": pname, "bound": kk}
+
+    return {"result": "unknown", "property": pname, "bound": k}
