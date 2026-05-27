@@ -9,6 +9,7 @@ A formal verification engine that parses real SystemVerilog (SV2017) RTL designs
 | **Parsing** | SV2017 to Z3 | Real RTL parsing via pyslang (always_ff, always_comb, assign, generate, system functions) |
 | | Multi-module flattening | Resolves cross-module hierarchy references |
 | | OpenTitan preprocessing | Expands `ASSERT_*` macros to standard SVA, strips `ifdef FPV_ON` |
+| | Struct port flattening | Replaces packed-struct ports with flat logic ports |
 | **Engines** | BMC | Incremental bounded model checking with binary search for minimum CEX depth |
 | | k-Induction | Proves safety properties that hold for all depths |
 | | IC3/PDR | Z3-solver-based property directed reachability with CTI priority queue, unsat-core generalization, clause subsumption, BMC fallback |
@@ -17,42 +18,49 @@ A formal verification engine that parses real SystemVerilog (SV2017) RTL designs
 | | Cover | BMC-based cover property engine |
 | | Random Simulation | Quick shallow-bug falsification with random stimulus |
 | **Analysis** | Fan-in Cone | Computes relevant state vars/inputs per property via Z3 dependency graph traversal |
-| | Engine Orchestrator | Per-property strategy (deep_state/datapath/control/mixed) + sequential/parallel dispatch |
+| | Orchestrator | Per-property strategy (deep_state/datapath/control/mixed) + sequential/parallel dispatch with SATIC3 as primary engine |
+| **Metrics** | Bit-level COI | Backward BFS on bit-sliced signal dependency graph |
+| | BMC Vacuity | Checks antecedent activation per property at bounded depth |
+| | Bounded Coverage | Model enumeration via independent solver per depth |
+| | AIG Proxy Complexity | Bit-op count, depth, dry-run solve time |
+| | MUS Proof Core | Which assumptions are essential/redundant per property |
+| | COI Mutation | Bit-flip faults in COI, filtered by equivalence check |
+| **Dashboard** | Quality Table | Per-property row: source label, COI%, vacuity, coverage, complexity, mutation score |
+| | Proof Core Footer | Assumption essentiality breakdown |
+| | Mutation Footer | Equivalent/redundant logic summary |
 | **Solvers** | Z3 | Primary SMT solver for all engines |
 | | PySAT (Glucose4) | SAT back-end via DIMACS export for SATIC3 |
 | | ABC (yosys) | External PDR backend via Verilog export |
-| | CNF Pre-blaster | Pre-bit-blasts transition relation (experimental) |
 
 ## Architecture
 
 ```
 fml/
-├── cli.py             — CLI entry point
+├── cli.py                  — CLI entry point
 ├── parser/
-│   ├── rtl_parser.py  — SV2017 → TransitionSystem (pyslang)
-│   ├── ot_preproc.py  — OpenTitan ASSERT→SVA preprocessor
-│   └── flatten.py     — Multi-module hierarchy flattener
+│   ├── rtl_parser.py       — SV2017 → TransitionSystem (pyslang)
+│   ├── ot_preproc.py       — OpenTitan ASSERT→SVA preprocessor
+│   └── flatten.py          — Multi-module hierarchy flattener
 ├── ir/
-│   └── transition_system.py  — Core IR (state vars, inputs, properties, assumptions)
+│   └── transition_system.py— Core IR (state vars, inputs, properties, assumptions, source tracking)
 ├── engine/
-│   ├── base.py        — Abstract engine base class
-│   ├── bmc.py         — Bounded model checking
-│   ├── ic3.py         — Z3 IC3/PDR
-│   ├── sat_ic3.py     — SAT-accelerated IC3
-│   ├── kind.py        — k-induction
-│   ├── cover.py       — Cover property engine
-│   ├── simulation.py  — Random simulation
-│   ├── orchestrator.py— Multi-engine dispatch
-│   ├── solver/        — Low-level solver backends
-│   │   ├── sat_solver.py     — Z3→DIMACS→PySAT bridge
-│   │   ├── cnf_context.py    — CNF pre-blaster
-│   │   └── abc_bridge.py     — Verilog→yosys→ABC PDR pipeline
-│   └── analysis/      — Pre-analysis
-│       ├── fan_in.py  — Fan-in cone computation
-│       └── aiger.py   — AIGER export (experimental)
+│   ├── base.py             — Abstract engine base class
+│   ├── bmc.py              — Bounded model checking
+│   ├── ic3.py              — Z3 IC3/PDR
+│   ├── sat_ic3.py          — SAT-accelerated IC3
+│   ├── kind.py             — k-induction
+│   ├── cover.py            — Cover property engine
+│   ├── simulation.py       — Random simulation
+│   ├── orchestrator.py     — Multi-engine dispatch (SATIC3→IC3→BMC)
+│   ├── solver/             — Low-level solver backends
+│   │   ├── sat_solver.py   — Z3→DIMACS→PySAT bridge
+│   │   └── abc_bridge.py   — Verilog→yosys→ABC PDR pipeline
+│   └── analysis/           — Pre-analysis and metrics
+│       ├── fan_in.py       — Fan-in cone computation
+│       └── metrics.py      — Quality metrics: COI, vacuity, coverage, complexity, proof core, mutation, dashboard
 ├── utils/
-│   └── helpers.py     — Shared utilities
-└── __main__.py        — `python -m fml` support
+│   └── helpers.py          — Shared utilities
+└── __main__.py             — `python -m fml` support
 
 examples/              — Test RTL designs
 tests/                 — Test suite
@@ -81,6 +89,12 @@ python -m fml --kind 20 design.sv
 python -m fml --auto design.sv
 python -m fml --auto --parallel design.sv
 
+# Quality Dashboard
+python -m fml design.sv --dashboard              # COI, vacuity, coverage, complexity
+python -m fml design.sv --dashboard --mutation    # + mutation testing
+python -m fml design.sv --auto -v                # verify + dashboard
+python -m fml design.sv --metrics                # machine-readable metrics JSON
+
 # Quick simulation
 python -m fml --sim design.sv
 
@@ -88,14 +102,14 @@ python -m fml --sim design.sv
 python -m fml --abc design.sv
 
 # Multi-engine with analysis
-python -m fml --auto --fanin --max-bmc 100 --max-kind 10 design.sv
+python -m fml --auto --max-bmc 100 --max-kind 10 design.sv
 
 # Parse inline RTL
 python -m fml --text 'module top(input clk, ...); ... endmodule' --bmc 50
 
 # OpenTitan designs (preprocess with ot_preproc.py first)
 python -c "from fml.parser.ot_preproc import preprocess_file; open('out.sv','w').write(preprocess_file('design.sv'))"
-python -m fml out.sv --bmc 50
+python -m fml out.sv --auto --dashboard
 ```
 
 ## Project Structure
@@ -109,7 +123,3 @@ python -m fml out.sv --bmc 50
 ├── pyproject.toml
 └── requirements.txt
 ```
-
-## License
-
-[License info]

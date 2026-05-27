@@ -29,7 +29,8 @@ def main():
     parser.add_argument("--abc", action="store_true", help="Run ABC PDR (yosys + ABC pipeline) only")
     parser.add_argument("--cover", action="store_true", help="Run cover property analysis")
     parser.add_argument("--fanin", action="store_true", help="Show fan-in cone analysis")
-    parser.add_argument("--metrics", action="store_true", help="Show property metrics (COI, vacuity, coverage, complexity)")
+    parser.add_argument("--metrics", action="store_true", help="Show property metrics")
+    parser.add_argument("--dashboard", action="store_true", help="Show assertion quality dashboard (metrics + proof core + mutation)")
     parser.add_argument("--mutation", action="store_true", help="Run mutation testing on properties")
     parser.add_argument("--text", "-t", help="Inline SystemVerilog text")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
@@ -89,6 +90,11 @@ endmodule
             _print_metrics(pname, m)
         return
 
+    if args.dashboard:
+        print(f"\n>>> Computing Assertion Quality Dashboard...", flush=True)
+        _run_dashboard(sys, args.verbose, do_mutation=args.mutation)
+        return
+
     if args.mutation:
         print(f"\n>>> Mutation Testing...")
         _run_mutation_tests(sys, verbose=args.verbose)
@@ -134,6 +140,9 @@ endmodule
         )
         print()
         print(format_orchestrator_results(results, verbose=args.verbose))
+
+        if args.dashboard or args.verbose:
+            _run_dashboard(sys, verbose=False, do_mutation=False)
         return
 
     if args.bmc > 0:
@@ -230,10 +239,40 @@ def _run_mutation_tests(ts, verbose=False):
         if mr.get("mutation_score") is not None:
             print(f"    Mutation score: {mr['mutation_score']:.1%}"
                   f" ({mr['mutations_caught']}/{mr['mutations_total']} caught)")
-            for m in mr.get("mutations", []):
-                print(f"      - {m['signal']}: {m['type']}")
+            for m in mr.get("details", [])[:5]:
+                print(f"      - {m['signal']}: {m['type']} {'caught' if m['caught'] else 'missed'}"
+                      f"{' (equivalent)' if m.get('equivalent') else ''}")
         else:
             print(f"    {mr.get('reason', 'no result')}")
+
+
+def _run_dashboard(ts, verbose=False, do_mutation=False):
+    from fml.engine.analysis.metrics import MetricsReport, format_dashboard
+    
+    metrics = MetricsReport(ts)
+    metrics_dict = {}
+    mutation_results = {}
+    proof_core_result = None
+    
+    for pname, p_expr in ts.properties:
+        m = metrics.compute(p_expr, include_proof_core=False)
+        metrics_dict[pname] = m
+    
+    for pname, p_expr in ts.trans_properties:
+        m = metrics.compute(p_expr, include_proof_core=False)
+        metrics_dict[pname] = m
+    
+    if do_mutation:
+        for pname, p_expr in ts.properties:
+            mr = metrics.mutation_test(p_expr, pname, max_mutations=10)
+            mutation_results[pname] = mr
+    
+    if ts.assumptions:
+        all_props = list(ts.properties) + list(ts.trans_properties)
+        pc = metrics.extract_proof_core(all_props)
+        proof_core_result = pc
+    
+    print(format_dashboard(ts, metrics_dict, mutation_results, proof_core_result, verbose=verbose))
 
 
 if __name__ == "__main__":

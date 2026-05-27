@@ -296,11 +296,7 @@ class RTLParser:
         step = 1
         if it_expr.kind == SyntaxKind.PostincrementExpression:
             step = 1
-        elif it_expr.kind == SyntaxKind.PreincrementExpression:
-            step = 1
         elif it_expr.kind == SyntaxKind.PostdecrementExpression:
-            step = -1
-        elif it_expr.kind == SyntaxKind.PredecrementExpression:
             step = -1
         elif it_expr.kind == SyntaxKind.AssignmentExpression:
             step_val = self._eval_literal_expr(it_expr.rhs, ts)
@@ -947,6 +943,12 @@ class RTLParser:
         if stmt.kind == SyntaxKind.ConcurrentAssertionMember:
             stmt = stmt.statement
 
+        try:
+            source_text = stmt.toString() if hasattr(stmt, 'toString') else str(stmt)
+            source_text = source_text.strip()
+        except Exception:
+            source_text = ""
+
         if directive is None:
             if stmt.kind == SyntaxKind.AssumePropertyStatement:
                 directive = "assume"
@@ -964,25 +966,25 @@ class RTLParser:
             clock = self._extract_clock(ps.clocking)
 
         if hasattr(ps, 'expr') and ps.expr is not None:
-            result = self._property_to_z3(ps.expr, clock, ts, directive)
+            result = self._property_to_z3(ps.expr, clock, ts, directive, source=source_text)
             if result is not None:
                 if directive == "assume":
                     prefix = f"assume_{len(ts.assumptions)}"
-                    ts.add_assumption(result)
+                    ts.add_assumption(result, source=source_text)
                 elif directive == "cover":
                     prefix = f"cover_{len(ts.cover_properties)}"
-                    ts.add_cover_property(prefix, result)
+                    ts.add_cover_property(prefix, result, source=source_text)
                 else:
                     prefix = f"assert_{len(ts.properties)}"
-                    ts.add_property(prefix, result)
+                    ts.add_property(prefix, result, source=source_text)
 
     def _property_to_z3(self, node, clock: str | None, ts: TransitionSystem,
-                        directive: str = "assert") -> z3.BoolRef | None:
+                        directive: str = "assert", source: str = "") -> z3.BoolRef | None:
         k = node.kind
 
         if k == SyntaxKind.ImplicationPropertyExpr:
-            ant = self._property_to_z3(node.left, clock, ts, directive)
-            cons = self._property_to_z3(node.right, clock, ts, directive)
+            ant = self._property_to_z3(node.left, clock, ts, directive, source=source)
+            cons = self._property_to_z3(node.right, clock, ts, directive, source=source)
             if ant is None or cons is None:
                 return None
             op_text = str(node.op.rawText) if hasattr(node.op, 'rawText') else "|->"
@@ -993,36 +995,38 @@ class RTLParser:
                 )
                 tp_expr = z3.Implies(ant, cons_next)
                 if directive == "assume":
-                    ts.add_assumption(tp_expr)
+                    ts.add_assumption(tp_expr, source=source)
                 else:
-                    ts.add_trans_property(f"{directive}_{len(ts.trans_properties)}", tp_expr)
+                    tn = f"trans_{directive}_{len(ts.trans_properties)}"
+                    ts.add_trans_property(tn, tp_expr, source=source)
                 return None
             else:
                 imp_expr = z3.Implies(ant, cons)
                 if directive == "assume":
-                    ts.add_assumption(imp_expr)
+                    ts.add_assumption(imp_expr, source=source)
                 else:
-                    ts.add_property(f"{directive}_{len(ts.properties)}", imp_expr)
+                    ts.add_property(f"{directive}_{len(ts.properties)}",
+                                    imp_expr, source=source)
                 return None
 
         if k in (SyntaxKind.ParenthesizedPropertyExpr, SyntaxKind.SimplePropertyExpr, SyntaxKind.SimpleSequenceExpr):
             if hasattr(node, 'expr'):
-                return self._property_to_z3(node.expr, clock, ts, directive)
+                return self._property_to_z3(node.expr, clock, ts, directive, source=source)
             return None
 
         if k == SyntaxKind.ClockingPropertyExpr:
             if hasattr(node, 'expr'):
-                return self._property_to_z3(node.expr, clock, ts, directive)
+                return self._property_to_z3(node.expr, clock, ts, directive, source=source)
             return None
 
         if k == SyntaxKind.ClockingSequenceExpr:
             if hasattr(node, 'expr'):
-                return self._property_to_z3(node.expr, clock, ts, directive)
+                return self._property_to_z3(node.expr, clock, ts, directive, source=source)
             return None
 
         if k == SyntaxKind.ParenthesizedSequenceExpr:
             if hasattr(node, 'expr'):
-                return self._property_to_z3(node.expr, clock, ts, directive)
+                return self._property_to_z3(node.expr, clock, ts, directive, source=source)
             return None
 
         if k == SyntaxKind.UnaryPropertyExpr:
@@ -1040,7 +1044,7 @@ class RTLParser:
                     elif 'SNexttimeKeyword' in ck:
                         keyword = 's_nexttime'
                     else:
-                        inner = self._property_to_z3(child, clock, ts, directive)
+                        inner = self._property_to_z3(child, clock, ts, directive, source=source)
             if inner is None:
                 return None
             if keyword == 'not':
@@ -1054,8 +1058,8 @@ class RTLParser:
         if k == SyntaxKind.AndSequenceExpr:
             children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
             if len(children) >= 2:
-                l = self._property_to_z3(children[0], clock, ts, directive)
-                r = self._property_to_z3(children[1], clock, ts, directive)
+                l = self._property_to_z3(children[0], clock, ts, directive, source=source)
+                r = self._property_to_z3(children[1], clock, ts, directive, source=source)
                 if l is not None and r is not None:
                     return z3.And(l, r)
             return None
@@ -1063,8 +1067,8 @@ class RTLParser:
         if k == SyntaxKind.OrSequenceExpr:
             children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
             if len(children) >= 2:
-                l = self._property_to_z3(children[0], clock, ts, directive)
-                r = self._property_to_z3(children[1], clock, ts, directive)
+                l = self._property_to_z3(children[0], clock, ts, directive, source=source)
+                r = self._property_to_z3(children[1], clock, ts, directive, source=source)
                 if l is not None and r is not None:
                     return z3.Or(l, r)
             return None
@@ -1072,8 +1076,8 @@ class RTLParser:
         if k == SyntaxKind.IntersectSequenceExpr:
             children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
             if len(children) >= 2:
-                l = self._property_to_z3(children[0], clock, ts, directive)
-                r = self._property_to_z3(children[1], clock, ts, directive)
+                l = self._property_to_z3(children[0], clock, ts, directive, source=source)
+                r = self._property_to_z3(children[1], clock, ts, directive, source=source)
                 if l is not None and r is not None:
                     return z3.And(l, r)
             return None
@@ -1081,8 +1085,8 @@ class RTLParser:
         if k == SyntaxKind.IffPropertyExpr:
             children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
             if len(children) >= 2:
-                l = self._property_to_z3(children[0], clock, ts, directive)
-                r = self._property_to_z3(children[1], clock, ts, directive)
+                l = self._property_to_z3(children[0], clock, ts, directive, source=source)
+                r = self._property_to_z3(children[1], clock, ts, directive, source=source)
                 if l is not None and r is not None:
                     return (l == r)
             return None
@@ -1090,8 +1094,8 @@ class RTLParser:
         if k == SyntaxKind.SUntilPropertyExpr:
             children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
             if len(children) >= 2:
-                l = self._property_to_z3(children[0], clock, ts, directive)
-                r = self._property_to_z3(children[1], clock, ts, directive)
+                l = self._property_to_z3(children[0], clock, ts, directive, source=source)
+                r = self._property_to_z3(children[1], clock, ts, directive, source=source)
                 if l is not None and r is not None:
                     return z3.Or(r, l)
             return None
@@ -1099,8 +1103,8 @@ class RTLParser:
         if k == SyntaxKind.UntilPropertyExpr:
             children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
             if len(children) >= 2:
-                l = self._property_to_z3(children[0], clock, ts, directive)
-                r = self._property_to_z3(children[1], clock, ts, directive)
+                l = self._property_to_z3(children[0], clock, ts, directive, source=source)
+                r = self._property_to_z3(children[1], clock, ts, directive, source=source)
                 if l is not None and r is not None:
                     return z3.Or(r, l)
             return None
@@ -1108,8 +1112,8 @@ class RTLParser:
         if k == SyntaxKind.SUntilWithPropertyExpr:
             children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
             if len(children) >= 2:
-                l = self._property_to_z3(children[0], clock, ts, directive)
-                r = self._property_to_z3(children[1], clock, ts, directive)
+                l = self._property_to_z3(children[0], clock, ts, directive, source=source)
+                r = self._property_to_z3(children[1], clock, ts, directive, source=source)
                 if l is not None and r is not None:
                     return z3.Or(r, l)
             return None
@@ -1117,8 +1121,8 @@ class RTLParser:
         if k == SyntaxKind.UntilWithPropertyExpr:
             children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
             if len(children) >= 2:
-                l = self._property_to_z3(children[0], clock, ts, directive)
-                r = self._property_to_z3(children[1], clock, ts, directive)
+                l = self._property_to_z3(children[0], clock, ts, directive, source=source)
+                r = self._property_to_z3(children[1], clock, ts, directive, source=source)
                 if l is not None and r is not None:
                     return z3.Or(r, l)
             return None
@@ -1129,13 +1133,13 @@ class RTLParser:
             cond = None
             items = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
             if len(items) >= 3:
-                cond = self._property_to_z3(items[0], clock, ts, directive)
-                ant = self._property_to_z3(items[1], clock, ts, directive)
-                cons = self._property_to_z3(items[2], clock, ts, directive)
+                cond = self._property_to_z3(items[0], clock, ts, directive, source=source)
+                ant = self._property_to_z3(items[1], clock, ts, directive, source=source)
+                cons = self._property_to_z3(items[2], clock, ts, directive, source=source)
             elif len(items) >= 2:
                 cond = items[0]
-                ant = self._property_to_z3(items[0] if cond else items[1], clock, ts, directive)
-                cons = self._property_to_z3(items[1] if cond else items[0], clock, ts, directive)
+                ant = self._property_to_z3(items[0] if cond else items[1], clock, ts, directive, source=source)
+                cons = self._property_to_z3(items[1] if cond else items[0], clock, ts, directive, source=source)
             if cond is not None and ant is not None and cons is not None:
                 return z3.Or(z3.Not(cond), z3.And(ant, cons))
             if ant is not None and cons is not None:
@@ -1147,7 +1151,7 @@ class RTLParser:
             if len(children) >= 2:
                 left_seq = children[0]
                 delay_elem = children[1]
-                left_expr = self._property_to_z3(left_seq, clock, ts, directive)
+                left_expr = self._property_to_z3(left_seq, clock, ts, directive, source=source)
                 if left_expr is None:
                     return None
                 delay_cycles = 1
@@ -1173,7 +1177,7 @@ class RTLParser:
                             break
                 if right_seq is None:
                     return left_expr
-                right_expr = self._property_to_z3(right_seq, clock, ts, directive)
+                right_expr = self._property_to_z3(right_seq, clock, ts, directive, source=source)
                 if right_expr is None:
                     return None
                 if delay_cycles == 0:
@@ -1208,7 +1212,7 @@ class RTLParser:
                         inner_seq = child
             if inner_seq is None:
                 return None
-            inner_expr = self._property_to_z3(inner_seq, clock, ts, directive)
+            inner_expr = self._property_to_z3(inner_seq, clock, ts, directive, source=source)
             if inner_expr is None:
                 return None
             if is_plus:

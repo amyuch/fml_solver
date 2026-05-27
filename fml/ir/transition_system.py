@@ -33,6 +33,11 @@ class TransitionSystem:
         self._comb_constraints: list[z3.BoolRef] = []
         self._next_state_exprs: dict[str, z3.BitVec] = {}
         self._var_dims: dict[str, list[int]] = {}  # var_name -> [dim_size, ...]
+        self.prop_sources: dict[str, str] = {}  # property_name -> original assertion text
+        self.trans_prop_sources: dict[str, str] = {}
+        self.cover_prop_sources: dict[str, str] = {}
+        self.assumption_sources: dict[int, str] = {}  # index -> source text
+        self._comb_targets: set[str] = set()  # state var names defined by comb constraints
 
     def add_state_var(self, name: str, width: int, init_val: int = 0, signed: bool = False):
         sv = StateVar(name, width, init_val)
@@ -108,17 +113,33 @@ class TransitionSystem:
     def add_trans(self, expr: z3.BoolRef):
         self._trans_constraints.append(expr)
 
-    def add_property(self, name: str, expr: z3.BoolRef):
+    def add_property(self, name: str, expr: z3.BoolRef, source: str = ""):
         self.properties.append((name, expr))
+        if source:
+            self.prop_sources[name] = source
 
-    def add_trans_property(self, name: str, expr: z3.BoolRef):
+    def add_trans_property(self, name: str, expr: z3.BoolRef, source: str = ""):
         self.trans_properties.append((name, expr))
+        if source:
+            self.trans_prop_sources[name] = source
 
-    def add_cover_property(self, name: str, expr: z3.BoolRef):
+    def add_cover_property(self, name: str, expr: z3.BoolRef, source: str = ""):
         self.cover_properties.append((name, expr))
+        if source:
+            self.cover_prop_sources[name] = source
 
-    def add_assumption(self, expr: z3.BoolRef):
+    def get_prop_source(self, name: str) -> str:
+        return (self.prop_sources.get(name) or
+                self.trans_prop_sources.get(name) or
+                self.cover_prop_sources.get(name) or "")
+
+    def add_assumption(self, expr: z3.BoolRef, source: str = ""):
         self.assumptions.append(expr)
+        if source:
+            self.assumption_sources[len(self.assumptions) - 1] = source
+
+    def get_assumption_source(self, idx: int) -> str:
+        return self.assumption_sources.get(idx, "")
 
     def add_param(self, name: str, width: int, init_val: int | None = None):
         self.params[name] = (width, init_val)
@@ -134,7 +155,19 @@ class TransitionSystem:
         return z3.And(*self.assumptions) if self.assumptions else z3.BoolVal(True)
 
     def add_comb_constraint(self, expr: z3.BoolRef):
+        """Add a combinational constraint (always_comb or assign target).
+
+        Tracks which state vars are defined by comb logic so coverage/etc.
+        can skip their (contradictory) init constraints.
+        """
+        import re as _re
         self._comb_constraints.append(expr)
+        lhs_str = str(expr)
+        for name in self.state_vars:
+            cur_str = str(self.get_cur(name))
+            # Match pattern: var) ==  or var ==  (bare or inside Extract/concat)
+            if _re.search(r'\b' + _re.escape(cur_str) + r'\)?\s*==', lhs_str):
+                self._comb_targets.add(name)
 
     @property
     def comb_expr(self) -> z3.BoolRef:
