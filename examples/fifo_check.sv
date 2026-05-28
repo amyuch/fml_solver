@@ -97,14 +97,22 @@ module fifo_check #(parameter WIDTH = 8) (
     ren && !(wptr == rptr) |=> rdata != $past(rdata) || $past(wdata) == $past(rdata));
 
   // --- Assumptions ---
-  // A1: threshold_val valid range
+  // A1: wen implies not full (design invariant — can't write when full)
+  assume property (@(posedge clk) disable iff (!rst_n)
+    wen |-> !((wptr[2] != rptr[2]) && (wptr[1:0] == rptr[1:0])));
+
+  // A2: ren implies not empty (design invariant — can't read when empty)
+  assume property (@(posedge clk) disable iff (!rst_n)
+    ren |-> !(wptr == rptr));
+
+  // A3: threshold_val valid range
   assume property (@(posedge clk) disable iff (!rst_n)
     threshold_val != 0);
 
-  // A2: rst_n always active in formal analysis
+  // A4: rst_n always active in formal analysis
   assume property (@(posedge clk) rst_n);
 
-  // A3: threshold within valid range
+  // A5: threshold within valid range
   assume property (@(posedge clk) disable iff (!rst_n)
     threshold_val <= 4);
 

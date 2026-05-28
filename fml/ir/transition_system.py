@@ -44,9 +44,6 @@ class TransitionSystem:
         self.state_vars[name] = sv
         self._cur[name] = z3.BitVec(f"{name}", width)
         self._next[name] = z3.BitVec(f"{name}_next", width)
-        self._init_constraints.append(
-            self._cur[name] == z3.BitVecVal(init_val, width)
-        )
         if signed:
             self.signed_vars.add(name)
 
@@ -56,13 +53,9 @@ class TransitionSystem:
         old_sv = self.state_vars[name]
         if new_width <= old_sv.width:
             return
-        self._remove_init_constraint(name)
         self.state_vars[name] = StateVar(name, new_width, old_sv.init_val)
         self._cur[name] = z3.BitVec(f"{name}", new_width)
         self._next[name] = z3.BitVec(f"{name}_next", new_width)
-        self._init_constraints.append(
-            self._cur[name] == z3.BitVecVal(old_sv.init_val, new_width)
-        )
 
     def _remove_init_constraint(self, name: str):
         self._init_constraints = [
@@ -182,7 +175,12 @@ class TransitionSystem:
 
     @property
     def init_expr(self) -> z3.BoolRef:
-        return z3.And(*self._init_constraints) if self._init_constraints else z3.BoolVal(True)
+        inits = []
+        for name, sv in self.state_vars.items():
+            if name not in self._comb_targets:
+                inits.append(self._cur[name] == z3.BitVecVal(sv.init_val, sv.width))
+        inits.extend(self._init_constraints)
+        return z3.And(*inits) if inits else z3.BoolVal(True)
 
     @property
     def trans_expr(self) -> z3.BoolRef:

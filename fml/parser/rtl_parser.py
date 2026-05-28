@@ -56,7 +56,10 @@ class RTLParser:
         self.driver = Driver()
         self.driver.addStandardArgs()
         self._past_counter = 0
+        self._chain_counter = 0
         self._hier_flattener = HierarchyFlattener()
+        self._delay_context: dict = {}  # "step_vars", "step_names", "max_step" from ##N
+        self._disable_cond: z3.BoolRef | None = None
 
     def parse_file(self, filepath: str) -> list[TransitionSystem]:
         self._module_path = filepath
@@ -944,7 +947,9 @@ class RTLParser:
             stmt = stmt.statement
 
         try:
-            source_text = stmt.toString() if hasattr(stmt, 'toString') else str(stmt)
+            source_text = str(stmt)
+            if source_text.startswith('AssertPropertyStatement'):
+                source_text = stmt.toString() if hasattr(stmt, 'toString') else str(stmt)
             source_text = source_text.strip()
         except Exception:
             source_text = ""
@@ -962,12 +967,35 @@ class RTLParser:
 
         ps = stmt.propertySpec
         clock = None
-        if hasattr(ps, 'clocking') and ps.clocking is not None:
-            clock = self._extract_clock(ps.clocking)
+        disable_cond = None
+
+        for child in ps:
+            if not hasattr(child, 'kind'):
+                continue
+            if child.kind == SyntaxKind.EventControlWithExpression:
+                clock = self._extract_clock(child)
+            elif child.kind == SyntaxKind.DisableIff:
+                for dc in child:
+                    if not hasattr(dc, 'kind'):
+                        continue
+                    dk = str(dc.kind)
+                    if 'Expression' in dk and 'Keyword' not in dk and 'Operator' not in dk:
+                        for sc in dc:
+                            if hasattr(sc, 'kind') and 'Expression' in str(sc.kind) and 'Keyword' not in str(sc.kind):
+                                dc = sc
+                                break
+                        bv = self._node_to_z3(dc)
+                        if bv is not None:
+                            disable_cond = (bv != 0)
+                        break
 
         if hasattr(ps, 'expr') and ps.expr is not None:
+            self._disable_cond = disable_cond
             result = self._property_to_z3(ps.expr, clock, ts, directive, source=source_text)
+            self._disable_cond = None
             if result is not None:
+                if disable_cond is not None:
+                    result = z3.Implies(z3.Not(disable_cond), result)
                 if directive == "assume":
                     prefix = f"assume_{len(ts.assumptions)}"
                     ts.add_assumption(result, source=source_text)
@@ -977,6 +1005,37 @@ class RTLParser:
                 else:
                     prefix = f"assert_{len(ts.properties)}"
                     ts.add_property(prefix, result, source=source_text)
+
+    def _build_step_chain(self, ts: TransitionSystem, n_steps: int
+                          ) -> tuple[list[dict[str, z3.BitVecRef]], list[z3.BoolRef]]:
+        """Build a chain of step variables for n_steps future cycles.
+
+        Returns (step_vars, step_constraints):
+          step_vars[k] = {name: z3_var} for step k (0 = current state)
+          step_constraints link each step to the next via ts transition functions.
+
+        Step variables have unique names per call to avoid collisions.
+        """
+        chain_id = self._chain_counter
+        self._chain_counter += 1
+        step_vars = [{name: ts.get_cur(name) for name in ts.state_vars}]
+        step_constraints = []
+        for k in range(1, n_steps + 1):
+            cur = step_vars[k - 1]
+            nxt = {}
+            for name in ts.state_vars:
+                w = ts.state_vars[name].width
+                nxt[name] = z3.BitVec(f"{name}_c{chain_id}_s{k}", w)
+            step_vars.append(nxt)
+            for name in ts.state_vars:
+                if name in ts._next_state_exprs:
+                    nexpr = ts._next_state_exprs[name]
+                    shifted = z3.substitute(
+                        nexpr,
+                        *[(ts.get_cur(n), cur[n]) for n in ts.state_vars]
+                    )
+                    step_constraints.append(nxt[name] == shifted)
+        return step_vars, step_constraints
 
     def _property_to_z3(self, node, clock: str | None, ts: TransitionSystem,
                         directive: str = "assert", source: str = "") -> z3.BoolRef | None:
@@ -989,11 +1048,88 @@ class RTLParser:
                 return None
             op_text = str(node.op.rawText) if hasattr(node.op, 'rawText') else "|->"
             if op_text == "|=>":
-                cons_next = z3.substitute(
-                    cons,
-                    *[(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
-                )
-                tp_expr = z3.Implies(ant, cons_next)
+                dc = self._delay_context
+                if dc.get("range_options"):
+                    step_vars = dc["step_vars"]
+                    max_step = dc["max_step"]
+                    cur = step_vars[max_step]
+                    extra = []
+                    for name in ts.state_vars:
+                        w = ts.state_vars[name].width
+                        ext = z3.BitVec(f"{name}_step_{max_step + 1}", w)
+                        extra.append((name, ext))
+                        # old name -> new name map for consequent substitution
+                    # Build extension constraints
+                    ext_constraints = []
+                    ext_map = {}
+                    for name in ts.state_vars:
+                        w = ts.state_vars[name].width
+                        ext = z3.BitVec(f"{name}_step_{max_step + 1}", w)
+                        ext_map[name] = ext
+                        if name in ts._next_state_exprs:
+                            nexpr = ts._next_state_exprs[name]
+                            shifted = z3.substitute(
+                                nexpr,
+                                *[(ts.get_cur(n), cur[n]) for n in ts.state_vars]
+                            )
+                            ext_constraints.append(ext == shifted)
+                    cons_delayed = z3.substitute(
+                        cons,
+                        *[(ts.get_cur(name), ext_map[name]) for name in ts.state_vars]
+                    )
+                    # For each option, shift by its delay+1
+                    shifted_options = []
+                    for k, opt_expr in dc["range_options"]:
+                        opt_shifted = z3.substitute(
+                            opt_expr,
+                            *[(ts.get_cur(name), step_vars[k][name])
+                              for name in ts.state_vars]
+                        )
+                        # consequent at step k+1
+                        if k < max_step:
+                            cons_k = z3.substitute(
+                                cons,
+                                *[(ts.get_cur(name), step_vars[k + 1][name])
+                                  for name in ts.state_vars]
+                            )
+                        else:
+                            cons_k = cons_delayed
+                        shifted_options.append(z3.And(opt_shifted, cons_k))
+                    tp_expr = z3.Implies(
+                        z3.And(ant, *ext_constraints),
+                        z3.Or(*shifted_options)
+                    )
+                elif dc.get("step_vars"):
+                    step_vars = dc["step_vars"]
+                    max_step = dc["max_step"]
+                    cur = step_vars[max_step]
+                    ext = {}
+                    extra = []
+                    for name in ts.state_vars:
+                        w = ts.state_vars[name].width
+                        ext[name] = z3.BitVec(f"{name}_step_{max_step + 1}", w)
+                        if name in ts._next_state_exprs:
+                            nexpr = ts._next_state_exprs[name]
+                            shifted = z3.substitute(
+                                nexpr,
+                                *[(ts.get_cur(n), cur[n]) for n in ts.state_vars]
+                            )
+                            extra.append(ext[name] == shifted)
+                    cons_delayed = z3.substitute(
+                        cons,
+                        *[(ts.get_cur(name), ext[name]) for name in ts.state_vars]
+                    )
+                    tp_expr = z3.Implies(z3.And(ant, *extra), cons_delayed)
+                else:
+                    cons_next = z3.substitute(
+                        cons,
+                        *[(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
+                    )
+                    tp_expr = z3.Implies(ant, cons_next)
+                self._delay_context = {}
+                dc = self._disable_cond
+                if dc is not None:
+                    tp_expr = z3.Implies(z3.Not(dc), tp_expr)
                 if directive == "assume":
                     ts.add_assumption(tp_expr, source=source)
                 else:
@@ -1002,6 +1138,9 @@ class RTLParser:
                 return None
             else:
                 imp_expr = z3.Implies(ant, cons)
+                dc = self._disable_cond
+                if dc is not None:
+                    imp_expr = z3.Implies(z3.Not(dc), imp_expr)
                 if directive == "assume":
                     ts.add_assumption(imp_expr, source=source)
                 else:
@@ -1156,6 +1295,7 @@ class RTLParser:
                     return None
                 delay_cycles = 1
                 right_seq = None
+                range_delays = None
                 for dc in delay_elem:
                     if hasattr(dc, 'kind'):
                         dk = str(dc.kind)
@@ -1166,7 +1306,14 @@ class RTLParser:
                                 pass
                         elif 'RangeSelect' in dk or dk == 'SimpleRangeSelect':
                             delay_left = self._eval_literal_expr(dc.left)
-                            if delay_left is not None:
+                            delay_right = (self._eval_literal_expr(dc.right)
+                                           if hasattr(dc, 'right') and dc.right
+                                           else None)
+                            if (delay_left is not None and delay_right is not None
+                                    and delay_left != delay_right):
+                                lo, hi = min(delay_left, delay_right), max(delay_left, delay_right)
+                                range_delays = (lo, hi)
+                            elif delay_left is not None:
                                 delay_cycles = delay_left
                         elif 'SimpleSequenceExpr' in dk or 'SimplePropertyExpr' in dk:
                             right_seq = dc
@@ -1180,19 +1327,67 @@ class RTLParser:
                 right_expr = self._property_to_z3(right_seq, clock, ts, directive, source=source)
                 if right_expr is None:
                     return None
+
+                max_delay = delay_cycles
+                if range_delays:
+                    max_delay = max(max_delay, range_delays[1])
+
+                # Build step-variable chain for multi-cycle delay
+                step_constraints = []
+                if max_delay > 0 and ts.state_vars:
+                    step_vars, step_constraints = self._build_step_chain(ts, max_delay)
+                    self._delay_context = {
+                        "step_vars": step_vars,
+                        "max_step": max_delay,
+                    }
+                else:
+                    step_vars = [{name: ts.get_cur(name) for name in ts.state_vars},
+                                 {name: ts.get_next(name) for name in ts.state_vars}]
+                    self._delay_context = {
+                        "step_vars": step_vars,
+                        "max_step": 1,
+                    }
+
+                if range_delays:
+                    lo, hi = range_delays
+                    options = []
+                    for k in range(lo, hi + 1):
+                        delayed = z3.substitute(
+                            right_expr,
+                            *[(ts.get_cur(name), step_vars[k][name])
+                              for name in ts.state_vars]
+                        )
+                        options.append(delayed)
+                    self._delay_context = {
+                        "step_vars": step_vars,
+                        "max_step": hi,
+                        "range_options": list(zip(range(lo, hi + 1), options)),
+                    }
+                    combined = z3.Or(*options)
+                    if step_constraints:
+                        return z3.And(left_expr, z3.And(*step_constraints), combined)
+                    return z3.And(left_expr, combined)
+
                 if delay_cycles == 0:
                     return z3.And(left_expr, right_expr)
-                for _ in range(delay_cycles):
-                    right_expr = z3.substitute(
-                        right_expr,
-                        *[(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
-                    )
-                return z3.And(left_expr, right_expr)
+
+                delayed = z3.substitute(
+                    right_expr,
+                    *[(ts.get_cur(name), step_vars[delay_cycles][name])
+                      for name in ts.state_vars]
+                )
+                if step_constraints:
+                    return z3.And(left_expr, z3.And(*step_constraints), delayed)
+                return z3.And(left_expr, delayed)
             return None
 
         if k == SyntaxKind.SequenceRepetition:
             rep_count = 1
             is_plus = False
+            is_star = False
+            has_range = False
+            range_lo = 1
+            range_hi = 1
             inner_seq = None
             for child in node:
                 if hasattr(child, 'kind'):
@@ -1200,7 +1395,7 @@ class RTLParser:
                     if 'Plus' in ck:
                         is_plus = True
                     elif 'Star' in ck:
-                        pass
+                        is_star = True
                     elif 'BitSelect' in ck:
                         for sc in child:
                             if hasattr(sc, 'kind') and 'IntegerLiteral' in str(sc.kind):
@@ -1208,6 +1403,14 @@ class RTLParser:
                                     rep_count = int(self._token_text(sc), 0)
                                 except:
                                     pass
+                    elif 'RangeSelect' in ck:
+                        lo_node = child.left if hasattr(child, 'left') else None
+                        hi_node = child.right if hasattr(child, 'right') else None
+                        lo = self._eval_literal_expr(lo_node) if lo_node is not None else None
+                        hi = self._eval_literal_expr(hi_node) if hi_node is not None else None
+                        if lo is not None and hi is not None:
+                            has_range = True
+                            range_lo, range_hi = min(lo, hi), max(lo, hi)
                     elif 'SimpleSequence' in ck or 'SimpleProperty' in ck:
                         inner_seq = child
             if inner_seq is None:
@@ -1215,9 +1418,57 @@ class RTLParser:
             inner_expr = self._property_to_z3(inner_seq, clock, ts, directive, source=source)
             if inner_expr is None:
                 return None
+
             if is_plus:
+                # [+] = one or more: bounded approximation up to MAX_REP
+                MAX_REP = 8
+                options = []
+                for n in range(1, MAX_REP + 1):
+                    if n == 1:
+                        options.append(inner_expr)
+                    else:
+                        sv, sc = self._build_step_chain(ts, n - 1)
+                        checks = [z3.substitute(
+                            inner_expr,
+                            *[(ts.get_cur(name), sv[k][name]) for name in ts.state_vars]
+                        ) for k in range(n)]
+                        opt = z3.And(*checks)
+                        if sc:
+                            opt = z3.And(z3.And(*sc), opt)
+                        options.append(opt)
+                return z3.Or(*options)
+
+            if has_range:
+                # [*M:N] = holds for M..N consecutive cycles
+                options = []
+                for n in range(range_lo, range_hi + 1):
+                    if n == 1:
+                        options.append(inner_expr)
+                    else:
+                        sv, sc = self._build_step_chain(ts, n - 1)
+                        checks = [z3.substitute(
+                            inner_expr,
+                            *[(ts.get_cur(name), sv[k][name]) for name in ts.state_vars]
+                        ) for k in range(n)]
+                        opt = z3.And(*checks)
+                        if sc:
+                            opt = z3.And(z3.And(*sc), opt)
+                        options.append(opt)
+                return z3.Or(*options)
+
+            if rep_count == 1:
                 return inner_expr
-            return inner_expr
+
+            # [*N]: holds for N consecutive cycles
+            sv, sc = self._build_step_chain(ts, rep_count - 1)
+            checks = [z3.substitute(
+                inner_expr,
+                *[(ts.get_cur(name), sv[k][name]) for name in ts.state_vars]
+            ) for k in range(rep_count)]
+            result = z3.And(*checks)
+            if sc:
+                result = z3.And(z3.And(*sc), result)
+            return result
 
         prop_bv = self._node_to_z3(node)
         if prop_bv is not None:
