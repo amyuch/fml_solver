@@ -489,7 +489,7 @@ def _process_system_func(self, func_name: str, args: list) -> z3.BitVecRef:
         return z3.BitVecVal(0, 1)
 
     if func_name == 'isunknown':
-        return z3.BitVecVal(0, 1)
+        return z3.BitVecVal(1, 1)
 
     if func_name in ('onehot0', 'onehot'):
         if not args:

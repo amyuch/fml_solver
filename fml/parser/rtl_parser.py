@@ -1492,6 +1492,30 @@ class RTLParser:
                 return z3.And(left_expr, delayed)
             return None
 
+        if k == SyntaxKind.WithinSequenceExpr:
+            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(children) >= 2:
+                l = self._property_to_z3(children[0], clock, ts, directive, source=source)
+                r = self._property_to_z3(children[1], clock, ts, directive, source=source)
+                if l is not None and r is not None:
+                    return z3.And(l, r)
+            return None
+
+        if k == SyntaxKind.ThroughoutSequenceExpr:
+            children = [c for c in node if hasattr(c, 'kind') and 'Keyword' not in str(c.kind)]
+            if len(children) >= 2:
+                l = self._property_to_z3(children[0], clock, ts, directive, source=source)
+                r = self._property_to_z3(children[1], clock, ts, directive, source=source)
+                if l is not None and r is not None:
+                    return z3.And(l, r)
+            return None
+
+        if k == SyntaxKind.FirstMatchSequenceExpr:
+            for child in node:
+                if hasattr(child, 'kind') and 'Sequence' in str(child.kind):
+                    return self._property_to_z3(child, clock, ts, directive, source=source)
+            return None
+
         if k == SyntaxKind.SequenceRepetition:
             return None
 
