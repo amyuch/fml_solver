@@ -39,8 +39,12 @@ fml/
 ├── cli.py                  — CLI entry point
 ├── parser/
 │   ├── rtl_parser.py       — SV2017 → TransitionSystem (pyslang)
+│   ├── node_to_z3.py       — AST node → Z3 expression
+│   ├── eval_expr.py        — Expression width/type evaluation
 │   ├── ot_preproc.py       — OpenTitan ASSERT→SVA preprocessor
-│   └── flatten.py          — Multi-module hierarchy flattener
+│   ├── hier_flatten.py     — Multi-module hierarchy flattener
+│   ├── struct_flattener.py — Packed-struct port flattening
+│   └── package_resolver.py — Package dependency resolution
 ├── ir/
 │   └── transition_system.py— Core IR (state vars, inputs, properties, assumptions, source tracking)
 ├── engine/
@@ -62,9 +66,8 @@ fml/
 │   └── helpers.py          — Shared utilities
 └── __main__.py             — `python -m fml` support
 
-examples/              — Test RTL designs
 tests/                 — Test suite
-benchmarks/            — Benchmark scripts
+examples/              — Example RTL designs
 ```
 
 ## Installation
@@ -76,6 +79,20 @@ pip install -r requirements.txt
 ```
 
 Requires Python 3.12+, z3-solver, pyslang, python-sat (PySAT). Optional: yosys + yosys-abc for ABC PDR backend.
+
+### Conda Environment
+
+```bash
+conda activate fml_solver
+```
+
+The `fml_solver` environment has all dependencies pre-installed. If setting up from scratch:
+
+```bash
+conda create -n fml_solver python=3.12
+conda activate fml_solver
+pip install z3-solver pyslang python-sat
+```
 
 ## Usage
 
@@ -117,9 +134,7 @@ python -m fml out.sv --auto --dashboard
 ```
 .
 ├── fml/               — Main package
-├── examples/          — Example RTL designs
 ├── tests/             — Test suite
-├── benchmarks/        — Benchmark scripts
 ├── pyproject.toml
 └── requirements.txt
 ```

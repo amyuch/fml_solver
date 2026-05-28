@@ -138,15 +138,39 @@ class RTLParser:
                 w = total
         if w is None or w <= 0:
             w = 1
+        genvar_ctx = getattr(self, '_genvar_subst', None) or {}
+        ctx_suffix = self._genvar_suffix(genvar_ctx) if genvar_ctx else ''
         for decl in node.declarators:
-            name = self._token_text(decl.name)
+            base_name = self._token_text(decl.name)
+            name = base_name + ctx_suffix
             init_val = None
             if hasattr(decl, 'initializer') and decl.initializer is not None:
                 init_val = self._eval_literal_expr(decl.initializer.expr, ts)
+            param_w = w
+            if init_val is not None:
+                required = max(init_val.bit_length(), 1)
+                if param_w < required:
+                    param_w = required
             if name not in ts.params:
-                ts.add_param(name, w, init_val)
+                ts.add_param(name, param_w, init_val)
                 if packed_dims:
                     ts.set_param_dims(name, packed_dims)
+
+    def _genvar_suffix(self, genvar_ctx: dict) -> str:
+        if not genvar_ctx:
+            return ''
+        parts = []
+        for k in sorted(genvar_ctx.keys()):
+            parts.append(f'{genvar_ctx[k]}')
+        return '__' + '_'.join(parts)
+
+    def _genvar_suffix_prefixes(self, genvar_ctx: dict):
+        sorted_ctx = sorted(genvar_ctx.items(), key=lambda x: x[0])
+        for i in range(len(sorted_ctx), -1, -1):
+            if i == 0:
+                yield ''
+            else:
+                yield '__' + '_'.join(str(v) for _, v in sorted_ctx[:i])
 
     def _resolve_header_imports(self, header, ts: TransitionSystem):
         """Resolve package imports from the module header and inject params."""
@@ -302,7 +326,7 @@ class RTLParser:
         elif it_expr.kind == SyntaxKind.PostdecrementExpression:
             step = -1
         elif it_expr.kind == SyntaxKind.AssignmentExpression:
-            step_val = self._eval_literal_expr(it_expr.rhs, ts)
+            step_val = self._eval_literal_expr(it_expr.right, ts)
             if step_val is not None:
                 step = step_val
 
@@ -360,8 +384,9 @@ class RTLParser:
             self._dispatch_generate_member(node, ts, genvar_subst)
 
     def _dispatch_generate_member(self, node, ts: TransitionSystem, genvar_subst=None):
+        saved = getattr(self, '_genvar_subst', None)
         if genvar_subst:
-            existing = getattr(self, '_genvar_subst', None) or {}
+            existing = saved or {}
             self._genvar_subst = {**existing, **genvar_subst}
         k = node.kind
         if k == SyntaxKind.AlwaysFFBlock:
@@ -396,8 +421,7 @@ class RTLParser:
             pass
         else:
             warnings.warn(f"Unhandled generate member: {k}", stacklevel=2)
-        if genvar_subst:
-            self._genvar_subst = None
+        self._genvar_subst = saved
 
     def _process_data_declaration(self, node, ts: TransitionSystem):
         signed = self._is_signed_type(node.type)
@@ -420,11 +444,37 @@ class RTLParser:
                 name = self._token_text(decl.name)
             except Exception:
                 continue
+            decl_dims = self._extract_declarator_dims(decl, ts)
+            full_dims = all_dims + decl_dims
+            dw = 1
+            for d in full_dims:
+                dw *= d
+            if dw > w:
+                w = dw
             is_new = name not in ts.state_vars and name not in ts.inputs
             if is_new:
                 ts.add_state_var(name, w, signed=signed)
-            if all_dims and is_new:
-                ts.set_var_dims(name, all_dims)
+            if full_dims and is_new:
+                ts.set_var_dims(name, full_dims)
+
+    def _extract_declarator_dims(self, decl, ts) -> list[int]:
+        dims = []
+        if hasattr(decl, 'dimensions') and decl.dimensions:
+            for dim in decl.dimensions:
+                if hasattr(dim, 'specifier') and dim.specifier:
+                    spec = dim.specifier
+                    if hasattr(spec, 'selector') and spec.selector:
+                        sel = spec.selector
+                        if sel.kind == SyntaxKind.BitSelect:
+                            dv = self._eval_literal_expr(sel.expr, ts)
+                            if dv is not None and dv > 0:
+                                dims.append(dv)
+                        elif sel.kind == SyntaxKind.SimpleRangeSelect:
+                            lv = self._eval_literal_expr(sel.left, ts)
+                            rv = self._eval_literal_expr(sel.right, ts)
+                            if lv is not None and rv is not None:
+                                dims.append(abs(lv - rv) + 1)
+        return dims
 
     def _extract_array_dims(self, type_node, ts) -> list[int]:
         dims = []
@@ -757,20 +807,134 @@ class RTLParser:
         self._current_ts = ts
         self._comb_mode = True
         stmt = block.statement
-        assignments = self._collect_comb_assignments(stmt, ts)
-        for target, expr in assignments.items():
-            cur = ts.get_cur(target)
-            cw = cur.size()
-            ew = expr.size()
-            if cw != ew:
-                if cw > ew:
-                    expr = z3.ZeroExt(cw - ew, expr)
-                else:
-                    expr = z3.Extract(cw - 1, 0, expr)
-            ts.add_comb_constraint(cur == expr)
+        self._process_comb_stmt(stmt, ts)
         self._comb_mode = False
 
-    def _collect_comb_assignments(self, stmt, ts, prior: dict = None) -> dict:
+    def _process_comb_stmt(self, stmt, ts: TransitionSystem):
+        k = stmt.kind
+        if k == SyntaxKind.SequentialBlockStatement:
+            for item in stmt.items:
+                if not hasattr(item, 'kind') or not hasattr(item, 'getFirstToken'):
+                    continue
+                self._process_comb_stmt(item, ts)
+        elif k == SyntaxKind.ExpressionStatement:
+            expr = stmt.expr
+            if expr is not None and hasattr(expr, 'kind') and expr.kind == SyntaxKind.AssignmentExpression:
+                left = expr.left
+                right = expr.right
+                lname = self._extract_name(left)
+                if lname is not None:
+                    if lname not in ts.state_vars and lname not in ts.inputs:
+                        w = self._expr_width(right, ts)
+                        ts.add_state_var(lname, w)
+                    l_expr = self._build_lhs_expr(left, lname, ts)
+                    if l_expr is None:
+                        l_expr = ts.get_cur(lname)
+                    r_expr = self._node_to_z3(right)
+                    lw = l_expr.size()
+                    rw = r_expr.size()
+                    if lw != rw:
+                        if lw > rw:
+                            r_expr = z3.ZeroExt(lw - rw, r_expr)
+                        else:
+                            r_expr = z3.Extract(lw - 1, 0, r_expr)
+                    ts.add_comb_constraint(l_expr == r_expr)
+        elif k in (SyntaxKind.ConditionalStatement,):
+            collect_lhs = {}
+            assignments = self._stmt_next_conditional(stmt, ts)
+            for target, expr in assignments.items():
+                lhs_node = collect_lhs.get(target)
+                l_expr = self._build_lhs_expr(lhs_node, target, ts) if lhs_node is not None else None
+                if l_expr is None:
+                    l_expr = ts.get_cur(target)
+                cw = l_expr.size()
+                ew = expr.size()
+                if cw != ew:
+                    if cw > ew:
+                        expr = z3.ZeroExt(cw - ew, expr)
+                    else:
+                        expr = z3.Extract(cw - 1, 0, expr)
+                ts.add_comb_constraint(l_expr == expr)
+        elif k == SyntaxKind.CaseStatement:
+            collect_lhs = {}
+            assignments = self._collect_case_assignments(stmt, ts)
+            for target, expr in assignments.items():
+                lhs_node = collect_lhs.get(target)
+                l_expr = self._build_lhs_expr(lhs_node, target, ts) if lhs_node is not None else None
+                if l_expr is None:
+                    l_expr = ts.get_cur(target)
+                cw = l_expr.size()
+                ew = expr.size()
+                if cw != ew:
+                    if cw > ew:
+                        expr = z3.ZeroExt(cw - ew, expr)
+                    else:
+                        expr = z3.Extract(cw - 1, 0, expr)
+                ts.add_comb_constraint(l_expr == expr)
+        elif k == SyntaxKind.ForLoopStatement:
+            assignments = self._collect_for_assignments(stmt, ts)
+            for target, expr in assignments.items():
+                l_expr = ts.get_cur(target)
+                cw = l_expr.size()
+                ew = expr.size()
+                if cw != ew:
+                    if cw > ew:
+                        expr = z3.ZeroExt(cw - ew, expr)
+                    else:
+                        expr = z3.Extract(cw - 1, 0, expr)
+                ts.add_comb_constraint(l_expr == expr)
+
+    def _collect_for_assignments(self, stmt, ts) -> dict:
+        init_val = None; bound_val = None; step = 1; loop_body = None
+        for child in stmt:
+            if hasattr(child, 'kind') and not isinstance(child.kind, int):
+                if child.kind.name == 'ForVariableDeclaration':
+                    decls = child.declarators if hasattr(child, 'declarators') else [child.declarator] if hasattr(child, 'declarator') else []
+                    for d in decls:
+                        if hasattr(d, 'initializer') and d.initializer is not None:
+                            init_val = self._eval_literal_expr(d.initializer.expr, ts)
+                elif child.kind.name in ('LessThanExpression', 'LessThanEqualExpression'):
+                    bound_val = self._eval_literal_expr(child.right, ts)
+                    if child.kind.name == 'LessThanEqualExpression' and bound_val is not None:
+                        bound_val += 1
+                elif child.kind.name in ('PostincrementExpression', 'PreincrementExpression'):
+                    step = 1
+                elif child.kind.name in ('PostdecrementExpression', 'PredecrementExpression'):
+                    step = -1
+                elif child.kind == SyntaxKind.SequentialBlockStatement:
+                    loop_body = child
+        result = {}
+        if init_val is not None and bound_val is not None and step != 0 and loop_body is not None:
+            saved = getattr(self, '_genvar_subst', None) or {}
+            for i in range(init_val, bound_val, step):
+                self._genvar_subst = {**saved, 'i': i}
+                body_result = self._collect_comb_assignments(loop_body, ts, result)
+                if body_result is None:
+                    continue
+                for var_name, expr in body_result.items():
+                    if var_name in result:
+                        old_val = result[var_name]
+                        bw = max(old_val.size(), expr.size())
+                        if old_val.size() < bw:
+                            old_val = z3.ZeroExt(bw - old_val.size(), old_val)
+                        bit_val = z3.Extract(i, i, expr) if i < expr.size() else z3.BitVecVal(0, 1)
+                        if i >= bw:
+                            result[var_name] = z3.Concat(z3.ZeroExt(i - bw, old_val), bit_val)
+                        elif i == bw - 1:
+                            upper = z3.Extract(bw - 2, 0, old_val) if bw > 1 else z3.BitVecVal(0, 1)
+                            result[var_name] = z3.Concat(bit_val, upper) if bw > 1 else bit_val
+                        elif i == 0:
+                            rest = z3.Extract(bw - 1, 1, old_val) if bw > 1 else z3.BitVecVal(0, 1)
+                            result[var_name] = z3.Concat(rest, bit_val) if bw > 1 else bit_val
+                        else:
+                            upper = z3.Extract(bw - 1, i + 1, old_val)
+                            lower = z3.Extract(i - 1, 0, old_val)
+                            result[var_name] = z3.Concat(upper, bit_val, lower)
+                    else:
+                        result[var_name] = expr
+        return result
+
+    def _collect_comb_assignments(self, stmt, ts, prior: dict = None, _lhs_track: dict = None) -> dict:
         if prior is None:
             prior = {}
         k = stmt.kind
@@ -784,6 +948,8 @@ class RTLParser:
                         w = self._expr_width(expr.right, ts)
                         ts.add_state_var(lname, w)
                     result[lname] = self._node_to_z3(expr.right)
+                    if _lhs_track is not None:
+                        _lhs_track[lname] = expr.left
             return result
         if k in (SyntaxKind.ConditionalStatement,):
             return self._stmt_next_conditional(stmt, ts)
@@ -794,7 +960,7 @@ class RTLParser:
             for item in stmt.items:
                 if not hasattr(item, 'kind') or not hasattr(item, 'getFirstToken'):
                     continue
-                item_assignments = self._collect_comb_assignments(item, ts, result)
+                item_assignments = self._collect_comb_assignments(item, ts, result, _lhs_track)
                 if item_assignments:
                     result.update(item_assignments)
             return result
@@ -912,7 +1078,9 @@ class RTLParser:
         base = ts.get_cur(lname)
         bw = base.size()
         result = base
-        for sel in left.selectors:
+        var_dims = ts.get_var_dims(lname) if hasattr(ts, 'get_var_dims') else []
+        num_sel = len(left.selectors)
+        for idx, sel in enumerate(left.selectors):
             if sel.kind == SyntaxKind.ElementSelect:
                 s = sel.selector
                 sk = s.kind
@@ -920,12 +1088,30 @@ class RTLParser:
                     idx_expr = self._eval_literal_expr(s.expr, ts)
                     if idx_expr is None:
                         continue
-                    if idx_expr >= bw:
-                        ts.widen_state_var(lname, idx_expr + 1)
-                        base = ts.get_cur(lname)
-                        bw = base.size()
-                        result = base
-                    result = z3.Extract(idx_expr, idx_expr, result)
+                    # Selectors match dimensions from outer-most to inner-most.
+                    # full_dims = [packed_dims..., unpacked_dims...].
+                    # The LAST dimension corresponds to the first selector (outer-most unpacked),
+                    # the second-to-last to the second selector, etc.
+                    dim_pos = num_sel - 1 - idx
+                    if 0 <= dim_pos < len(var_dims):
+                        ew = bw // var_dims[dim_pos]
+                        if ew <= 0:
+                            continue
+                        offset = idx_expr * ew
+                        if offset + ew > bw:
+                            ts.widen_state_var(lname, offset + ew)
+                            base = ts.get_cur(lname)
+                            bw = base.size()
+                            result = base
+                        result = z3.Extract(offset + ew - 1, offset, result)
+                        bw = result.size()
+                    else:
+                        if idx_expr >= bw:
+                            ts.widen_state_var(lname, idx_expr + 1)
+                            base = ts.get_cur(lname)
+                            bw = base.size()
+                            result = base
+                        result = z3.Extract(idx_expr, idx_expr, result)
                 elif sk == SyntaxKind.SimpleRangeSelect:
                     hi = self._eval_literal_expr(s.left, ts)
                     lo = self._eval_literal_expr(s.right, ts)

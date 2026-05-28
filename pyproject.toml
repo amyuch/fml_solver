@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "z3-solver>=4.16",
     "pyslang>=11.0",
+    "python-sat>=1.8.dev2",
 ]
 
 [project.scripts]

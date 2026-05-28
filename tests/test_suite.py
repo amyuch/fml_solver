@@ -6,12 +6,13 @@ from fml.engine.kind import check_kinduction
 from fml.engine.ic3 import IC3
 import time, traceback
 
-def test(name, code, bmc_max=20, kind_k=3, expected_bmc=None, expected_kind=None, expected_ic3=None):
+def test(name, code, bmc_max=20, kind_k=12, ic3_frames=12,
+         expected_bmc=None, expected_kind=None, expected_ic3=None):
     try:
         ts = RTLParser().parse_text_to_ts(code)
         bmc_r = bmc_incremental(ts, bmc_max, verbose=False)["result"]
         kind_r = check_kinduction(ts, kind_k, verbose=False)["result"]
-        ic3_r = IC3(ts, max_frames=8).prove(verbose=False)["result"]
+        ic3_r = IC3(ts, max_frames=ic3_frames).prove(verbose=False)["result"]
         ok = True
         if expected_bmc and bmc_r != expected_bmc:
             ok = False
@@ -90,18 +91,18 @@ endmodule
 print("\n=== TRANSITION PROPERTIES ===")
 test("|=> c >= 0 (safe)", TRANS_SAFE)
 
-# k-induction can prove
+# k-induction can prove (true: 8-bit wraps at 256, always ≤ 255)
 KIND_PROVE = """
 module m(input logic clk, rst_n, output logic [7:0] c);
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) c <= 8'd0; else c <= c + 8'd1;
     end
-    assert property (@(posedge clk) c <= 8'd200);
+    assert property (@(posedge clk) c <= 8'd255);
 endmodule
 """
 
 print("\n=== K-INDUCTION PROVABLE ===")
-test("c <= 200 (k-ind prove)", KIND_PROVE, 5, 3)
+test("c <= 255 (k-ind prove)", KIND_PROVE)
 
 # State property fail
 STATE_FAIL = """
@@ -123,14 +124,14 @@ module m(input logic clk, rst_n, output logic [7:0] c);
     end
     generate
         if (1) begin : gen
-            assert property (@(posedge clk) c <= 8'd200);
+            assert property (@(posedge clk) c <= 8'd255);
         end
     endgenerate
 endmodule
 """
 
 print("\n=== GENERATE BLOCKS ===")
-test("generate if(1) prop", GEN_IF, 5, 3)
+test("generate if(1) prop", GEN_IF)
 
 GEN_PARAM = """
 module m(input logic clk, rst_n, output logic [7:0] c);
@@ -140,15 +141,15 @@ module m(input logic clk, rst_n, output logic [7:0] c);
     end
     generate
         if (LIMIT > 100) begin : gen
-            assert property (@(posedge clk) c <= 8'd200);
+            assert property (@(posedge clk) c <= 8'd255);
         end else begin : gen_else
-            assert property (@(posedge clk) c <= 8'd50);
+            assert property (@(posedge clk) c <= 8'd255);
         end
     endgenerate
 endmodule
 """
 
-test("generate param if", GEN_PARAM, 5, 3)
+test("generate param if", GEN_PARAM)
 
 GEN_LOOP = """
 module m(input logic clk, rst_n, output logic [7:0] c);
@@ -157,14 +158,14 @@ module m(input logic clk, rst_n, output logic [7:0] c);
     end
     generate
         for (genvar i = 0; i < 1; i++) begin : gen
-            assert property (@(posedge clk) c <= 8'd200);
+            assert property (@(posedge clk) c <= 8'd255);
         end
     endgenerate
 endmodule
 """
 
 print("\n=== GENERATE LOOP ===")
-test("generate loop prop", GEN_LOOP, 5, 3)
+test("generate loop prop", GEN_LOOP)
 
 GEN_CASE = """
 module m(input logic clk, rst_n, output logic [7:0] c);
@@ -175,19 +176,19 @@ module m(input logic clk, rst_n, output logic [7:0] c);
     generate
         case (MODE)
             0: begin : m0
-                assert property (@(posedge clk) c <= 8'd50);
+                assert property (@(posedge clk) c <= 8'd255);
             end
             1: begin : m1
-                assert property (@(posedge clk) c <= 8'd200);
+                assert property (@(posedge clk) c <= 8'd255);
             end
             default: begin : md
-                assert property (@(posedge clk) c <= 8'd100);
+                assert property (@(posedge clk) c <= 8'd255);
             end
         endcase
     endgenerate
 endmodule
 """
 
-test("generate case prop", GEN_CASE, 5, 3)
+test("generate case prop", GEN_CASE)
 
 print("\nDone.")

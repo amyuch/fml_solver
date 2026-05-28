@@ -100,8 +100,11 @@ def _signal_width(self, name: str, ts: TransitionSystem) -> int:
         return ts.state_vars[name].width
     if name in ts.inputs:
         return ts.inputs[name].width
-    if name in ts.params:
-        return ts.params[name][0]
+    genvar_ctx = getattr(self, '_genvar_subst', None) or {}
+    for suffix in self._genvar_suffix_prefixes(genvar_ctx):
+        lookup = name + suffix
+        if lookup in ts.params:
+            return ts.params[lookup][0]
     return 1
 
 
@@ -128,8 +131,12 @@ def _eval_literal_expr(self, node, ts: TransitionSystem = None) -> int | None:
         name = self._token_text(node.identifier)
         if getattr(self, '_genvar_subst', None) and name in self._genvar_subst:
             return self._genvar_subst[name]
-        if ts is not None and name in ts.params:
-            return ts.params[name][1]
+        if ts is not None:
+            genvar_ctx = getattr(self, '_genvar_subst', None) or {}
+            for suffix in self._genvar_suffix_prefixes(genvar_ctx):
+                lookup = name + suffix
+                if lookup in ts.params:
+                    return ts.params[lookup][1]
         return None
 
     if k == SyntaxKind.InvocationExpression:
@@ -325,6 +332,8 @@ def _expr_width(self, node, ts: TransitionSystem) -> int:
                     return self._expr_width(args[0], ts)
                 return 1
         return 1
+    if k == SyntaxKind.CastExpression:
+        return self._expr_width(node.right, ts)
     return 1
 
 

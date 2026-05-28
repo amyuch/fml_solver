@@ -19,6 +19,15 @@ def _node_to_z3(self, node) -> z3.BitVecRef:
                 bw = max(val.bit_length(), 1)
                 return z3.BitVecVal(val, bw)
             return z3.BitVecVal(val, 1)
+        genvar_ctx = getattr(self, '_genvar_subst', None) or {}
+        for suffix in self._genvar_suffix_prefixes(genvar_ctx):
+            lookup = name + suffix
+            if lookup in self._current_ts.params:
+                pv = self._current_ts.params[lookup][1]
+                if pv is not None:
+                    bw = self._current_ts.params[lookup][0]
+                    return z3.BitVecVal(pv, bw)
+                break
         w = self._signal_width(name, self._current_ts)
         if name in self._current_ts.state_vars:
             return self._current_ts.get_cur(name)
@@ -30,11 +39,48 @@ def _node_to_z3(self, node) -> z3.BitVecRef:
     if k == SyntaxKind.IdentifierSelectName:
         name = self._token_text(node.identifier)
         # Check params with known values before creating state var
-        if name in self._current_ts.params:
-            pv = self._current_ts.params[name][1]
-            if pv is not None:
-                bw = self._signal_width(name, self._current_ts)
-                result = z3.BitVecVal(pv, bw)
+        genvar_ctx = getattr(self, '_genvar_subst', None) or {}
+        param_found = False
+        for suffix in self._genvar_suffix_prefixes(genvar_ctx):
+            lookup = name + suffix
+            if lookup in self._current_ts.params:
+                pv = self._current_ts.params[lookup][1]
+                if pv is not None:
+                    bw = self._current_ts.params[lookup][0]
+                    result = z3.BitVecVal(pv, bw)
+                    param_dims = self._current_ts.get_param_dims(lookup)
+                    dim_idx = 0
+                    for sel in node.selectors:
+                        if sel.kind == SyntaxKind.ElementSelect:
+                            s = sel.selector
+                            sk = s.kind
+                            if sk == SyntaxKind.BitSelect:
+                                if dim_idx < len(param_dims):
+                                    ew = bw // param_dims[dim_idx]
+                                    idx_expr = self._eval_literal_expr(s.expr, None)
+                                    if idx_expr is not None:
+                                        offset = idx_expr * ew
+                                        result = z3.Extract(offset + ew - 1, offset, result)
+                                else:
+                                    idx_expr = self._eval_literal_expr(s.expr, None)
+                                    if idx_expr is not None and 0 <= idx_expr < bw:
+                                        result = z3.Extract(idx_expr, idx_expr, result)
+                            elif sk == SyntaxKind.SimpleRangeSelect:
+                                hi = self._eval_literal_expr(s.left, None)
+                                lo = self._eval_literal_expr(s.right, None)
+                                if hi is not None and lo is not None:
+                                    if lo > hi: lo, hi = hi, lo
+                                    if 0 <= lo <= hi < bw:
+                                        result = z3.Extract(hi, lo, result)
+                            dim_idx += 1
+                    return result
+                param_found = True
+                break
+        if not param_found:
+            # Check unsuffixed name too
+            if name in self._current_ts.params and self._current_ts.params[name][1] is not None:
+                bw = self._current_ts.params[name][0]
+                result = z3.BitVecVal(self._current_ts.params[name][1], bw)
                 param_dims = self._current_ts.get_param_dims(name)
                 dim_idx = 0
                 for sel in node.selectors:
@@ -93,6 +139,8 @@ def _node_to_z3(self, node) -> z3.BitVecRef:
                         if lo > hi:
                             lo, hi = hi, lo
                         w_sel = hi - lo + 1
+                        if hi >= result.size():
+                            result = _zext(result, hi + 1)
                         if w_sel == w:
                             return result
                         result = z3.Extract(hi, lo, result)
@@ -112,6 +160,8 @@ def _node_to_z3(self, node) -> z3.BitVecRef:
                         if z3.is_bv_value(idx):
                             bit = idx.as_long()
                             offset = bit * ew
+                            if offset + ew > result.size():
+                                result = _zext(result, offset + ew)
                             result = z3.Extract(offset + ew - 1, offset, result)
                         else:
                             shift_w = max(result.size(), idx.size())
@@ -123,24 +173,35 @@ def _node_to_z3(self, node) -> z3.BitVecRef:
                     else:
                         if z3.is_bv_value(idx):
                             bit = idx.as_long()
+                            if bit >= result.size():
+                                result = _zext(result, bit + 1)
                             result = z3.Extract(bit, bit, result)
                         else:
-                            shift = _zext(idx, w)
-                            result = z3.Extract(0, 0, z3.LShR(result, shift))
+                            lshr_w = max(result.size(), idx.size())
+                            result_z = _zext(result, lshr_w)
+                            shift = _zext(idx, lshr_w)
+                            result = z3.Extract(0, 0, z3.LShR(result_z, shift))
 
                 elif sk == SyntaxKind.AscendingRangeSelect:
                     base_expr = self._node_to_z3(selector.left)
                     width_val = self._node_to_z3(selector.right)
                     sw = width_val.as_long() if z3.is_bv_value(width_val) else 1
-                    shift = _zext(base_expr, w)
-                    result = z3.Extract(sw - 1, 0, z3.LShR(result, shift))
+                    if sw <= 0:
+                        sw = 1
+                    lshr_w = max(result.size(), base_expr.size())
+                    shift = _zext(base_expr, lshr_w)
+                    result = z3.Extract(sw - 1, 0, z3.LShR(_zext(result, lshr_w), shift))
 
                 elif sk == SyntaxKind.DescendingRangeSelect:
                     base_expr = self._node_to_z3(selector.left)
                     width_val = self._node_to_z3(selector.right)
                     sw = width_val.as_long() if z3.is_bv_value(width_val) else 1
-                    shift = _zext(base_expr - (sw - 1), w)
-                    result = z3.Extract(sw - 1, 0, z3.LShR(result, shift))
+                    if sw <= 0:
+                        sw = 1
+                    adjusted = base_expr - (sw - 1)
+                    lshr_w = max(result.size(), adjusted.size())
+                    shift = _zext(adjusted, lshr_w)
+                    result = z3.Extract(sw - 1, 0, z3.LShR(_zext(result, lshr_w), shift))
         return result
 
     if k == SyntaxKind.IntegerLiteralExpression:
@@ -407,6 +468,34 @@ def _node_to_z3(self, node) -> z3.BitVecRef:
 
     if k == SyntaxKind.ScopedName:
         return self._node_to_z3(list(node)[0])
+
+    if k == SyntaxKind.CastExpression:
+        result = self._node_to_z3(node.right)
+        lw = self._expr_width(node, self._current_ts)
+        if lw is not None and result.size() < lw:
+            result = z3.ZeroExt(lw - result.size(), result)
+        elif lw is not None and result.size() > lw:
+            result = z3.Extract(lw - 1, 0, result)
+        return result
+
+    if k == SyntaxKind.UnaryBitwiseXorExpression:
+        op = self._node_to_z3(node.operand)
+        xor_result = z3.BitVecVal(0, 1)
+        for i in range(op.size()):
+            xor_result = xor_result ^ z3.Extract(i, i, op)
+        return z3.ZeroExt(0, xor_result)
+
+    if k == SyntaxKind.PostincrementExpression:
+        return self._node_to_z3(node.operand) + 1
+
+    if k == SyntaxKind.PostdecrementExpression:
+        return self._node_to_z3(node.operand) - 1
+
+    if k == SyntaxKind.LogicalImplicationExpression:
+        l = self._node_to_z3(node.left)
+        r = self._node_to_z3(node.right)
+        l, r = self._z3_promote_pair(l, r)
+        return z3.If(z3.Or(l == 0, r != 0), z3.BitVecVal(1, 1), z3.BitVecVal(0, 1))
 
     warnings.warn(f"Unhandled expression node: {k}", stacklevel=2)
     return z3.BitVecVal(0, 1)
