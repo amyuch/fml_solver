@@ -191,4 +191,105 @@ endmodule
 
 test("generate case prop", GEN_CASE)
 
+# Named sequence/property tests
+NAMED_SEQ = """
+module m(input logic [7:0] a, input logic [7:0] b);
+    sequence s_eq;
+        a == b;
+    endsequence
+    assert property (s_eq);
+endmodule
+"""
+
+NAMED_PROP = """
+module m(input logic [7:0] a, input logic [7:0] b);
+    property p_eq;
+        a == b;
+    endproperty
+    assert property (p_eq);
+endmodule
+"""
+
+NAMED_PROP_SAFE = """
+module m(input logic clk, rst_n, output logic [7:0] c);
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) c <= 8'd0; else c <= c + 8'd1;
+    end
+    property c_max;
+        @(posedge clk) disable iff (!rst_n) c <= 8'd255;
+    endproperty
+    assert property (c_max);
+endmodule
+"""
+
+print("\n=== NAMED SEQUENCE/PROPERTY ===")
+test("named sequence (comb)", NAMED_SEQ, 5, 5)
+test("named property (comb)", NAMED_PROP, 5, 5)
+test("named property (clocked)", NAMED_PROP_SAFE, 20, 12)
+
+# Local variable in SVA tests
+LOCAL_VAR_COMB = """
+module m(input logic [7:0] a, input logic [7:0] d);
+    sequence s;
+        logic [7:0] v;
+        (a, v = d);
+    endsequence
+    assert property (s);
+endmodule
+"""
+
+LOCAL_VAR_TEMP = """
+module m(input logic clk, rst_n, input logic [7:0] a, input logic [7:0] b, input logic [7:0] d);
+    sequence s;
+        logic [7:0] v;
+        (a, v = d) ##1 (b, v == d);
+    endsequence
+    assert property (@(posedge clk) disable iff (!rst_n) s);
+endmodule
+"""
+
+print("\n=== LOCAL VARIABLES IN SVA ===")
+test("local var (comb seq)", LOCAL_VAR_COMB, 5, 5)
+test("local var (temp seq)", LOCAL_VAR_TEMP, 10, 8)
+
+# Interface / Modport tests
+IFACE_BASIC = """
+interface simple_if;
+    logic [7:0] data;
+    modport host (output data);
+endinterface
+
+module top(simple_if.host bus, input [7:0] val);
+    assign bus.data = val;
+endmodule
+"""
+
+IFACE_INPUT = """
+interface simple_if;
+    logic [7:0] data;
+    modport device (input data);
+endinterface
+
+module top(simple_if.device bus, output [7:0] val);
+    assign val = bus.data;
+endmodule
+"""
+
+# Parameterized interface test
+IFACE_PARAM = """
+interface tl_if #(parameter int DW = 32);
+    logic [DW-1:0] a_req, a_grant;
+    modport host (input a_req, output a_grant);
+endinterface
+
+module top(tl_if #(.DW(16)).host bus, input [15:0] val);
+    assign bus.a_grant = val;
+endmodule
+"""
+
+print("\n=== INTERFACE / MODPORT ===")
+test("iface basic (output)", IFACE_BASIC, 5, 5)
+test("iface input", IFACE_INPUT, 5, 5)
+test("iface parameterized", IFACE_PARAM, 5, 5)
+
 print("\nDone.")

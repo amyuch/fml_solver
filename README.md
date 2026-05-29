@@ -43,8 +43,10 @@ fml/
 │   ├── eval_expr.py        — Expression width/type evaluation
 │   ├── ot_preproc.py       — OpenTitan ASSERT→SVA preprocessor
 │   ├── hier_flatten.py     — Multi-module hierarchy flattener
+│   ├── interface_flattener.py — Interface/modport flattener (tl_if, struct ports)
 │   ├── struct_flattener.py — Packed-struct port flattening
-│   └── package_resolver.py — Package dependency resolution
+│   ├── package_resolver.py — Package dependency resolution
+│   └── utils.py            — Shared utilities (dimension mapping, name extraction)
 ├── ir/
 │   └── transition_system.py— Core IR (state vars, inputs, properties, assumptions, source tracking)
 ├── engine/

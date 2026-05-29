@@ -260,7 +260,24 @@ def _expr_width(self, node, ts: TransitionSystem) -> int:
         return self._signal_width(name, ts)
     if k == SyntaxKind.IdentifierSelectName:
         name = self._token_text(node.identifier)
-        return self._signal_width(name, ts)
+        w = self._signal_width(name, ts)
+        if hasattr(node, 'selectors') and node.selectors:
+            var_dims = ts.get_var_dims(name) if ts is not None else []
+            for idx, sel in enumerate(node.selectors):
+                if sel.kind == SyntaxKind.ElementSelect:
+                    s = sel.selector
+                    num_packed = ts.get_var_num_packed(name) if ts is not None and hasattr(ts, 'get_var_num_packed') else 0
+                    dim_pos = self._dim_pos_for_selector(idx, num_packed, len(var_dims))
+                    if 0 <= dim_pos < len(var_dims) and s.kind == SyntaxKind.BitSelect:
+                        w //= var_dims[dim_pos]
+                    elif s.kind == SyntaxKind.SimpleRangeSelect:
+                        hi = self._eval_literal_expr(s.left, ts)
+                        lo = self._eval_literal_expr(s.right, ts)
+                        if hi is not None and lo is not None:
+                            w = abs(hi - lo) + 1
+                    elif s.kind == SyntaxKind.BitSelect:
+                        w = 1
+        return w
     if k == SyntaxKind.IntegerLiteralExpression:
         try:
             val = int(self._token_text(node.literal), 0)

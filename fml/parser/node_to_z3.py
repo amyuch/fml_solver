@@ -13,6 +13,11 @@ def _node_to_z3(self, node) -> z3.BitVecRef:
 
     if k == SyntaxKind.IdentifierName:
         name = self._token_text(node.identifier)
+        local_vars = getattr(self, '_current_local_vars', None)
+        if local_vars and name in local_vars:
+            ts_var = local_vars[name]
+            if ts_var in self._current_ts.state_vars:
+                return self._current_ts.get_cur(ts_var)
         if getattr(self, '_genvar_subst', None) and name in self._genvar_subst:
             val = self._genvar_subst[name]
             if isinstance(val, int):
@@ -156,7 +161,9 @@ def _node_to_z3(self, node) -> z3.BitVecRef:
                 elif sk == SyntaxKind.BitSelect:
                     idx = self._node_to_z3(selector.expr)
                     if dim_idx < len(array_dims):
-                        ew = result.size() // array_dims[dim_idx]
+                        num_packed = self._current_ts.get_var_num_packed(name) if hasattr(self._current_ts, 'get_var_num_packed') else 0
+                        dim_pos = self._dim_pos_for_selector(dim_idx, num_packed, len(array_dims))
+                        ew = result.size() // array_dims[dim_pos]
                         if z3.is_bv_value(idx):
                             bit = idx.as_long()
                             offset = bit * ew
@@ -467,6 +474,9 @@ def _node_to_z3(self, node) -> z3.BitVecRef:
         return z3.BitVecVal(0, 1)
 
     if k == SyntaxKind.ScopedName:
+        iface_flat = self._resolve_interface_dot_access(node)
+        if iface_flat is not None:
+            return iface_flat
         return self._node_to_z3(list(node)[0])
 
     if k == SyntaxKind.CastExpression:

@@ -33,6 +33,7 @@ class TransitionSystem:
         self._comb_constraints: list[z3.BoolRef] = []
         self._next_state_exprs: dict[str, z3.BitVec] = {}
         self._var_dims: dict[str, list[int]] = {}  # var_name -> [dim_size, ...]
+        self._var_num_packed: dict[str, int] = {}  # var_name -> num_packed_dims
         self.prop_sources: dict[str, str] = {}  # property_name -> original assertion text
         self.trans_prop_sources: dict[str, str] = {}
         self.cover_prop_sources: dict[str, str] = {}
@@ -81,11 +82,15 @@ class TransitionSystem:
                     expr = z3.Extract(tw - 1, 0, expr)
         self._next_state_exprs[name] = expr
 
-    def set_var_dims(self, name: str, dims: list[int]):
+    def set_var_dims(self, name: str, dims: list[int], num_packed: int = 0):
         self._var_dims[name] = dims
+        self._var_num_packed[name] = num_packed
 
     def get_var_dims(self, name: str) -> list[int]:
         return self._var_dims.get(name, [])
+
+    def get_var_num_packed(self, name: str) -> int:
+        return self._var_num_packed.get(name, 0)
 
     def get_elem_width(self, name: str) -> int:
         """Compute element width for array variables."""
@@ -134,6 +139,20 @@ class TransitionSystem:
     def get_assumption_source(self, idx: int) -> str:
         return self.assumption_sources.get(idx, "")
 
+    @property
+    def comb_assumption_expr(self) -> z3.BoolRef:
+        """Return only non-temporal assumptions (no _next or step-chain vars)."""
+        import re as _re
+        safe = []
+        for a in self.assumptions:
+            s = str(a)
+            if '_next' in s:
+                continue
+            if _re.search(r'_c\d+_s', s):
+                continue
+            safe.append(a)
+        return z3.And(*safe) if safe else z3.BoolVal(True)
+
     def add_param(self, name: str, width: int, init_val: int | None = None):
         self.params[name] = (width, init_val)
 
@@ -158,8 +177,8 @@ class TransitionSystem:
         lhs_str = str(expr)
         for name in self.state_vars:
             cur_str = str(self.get_cur(name))
-            # Match pattern: var) ==  or var ==  (bare or inside Extract/concat)
-            if _re.search(r'\b' + _re.escape(cur_str) + r'\)?\s*==', lhs_str):
+            # Match pattern: var ==  at top level (not nested inside Extract/If/etc)
+            if _re.match(_re.escape(cur_str) + r'\s*==', lhs_str):
                 self._comb_targets.add(name)
 
     @property

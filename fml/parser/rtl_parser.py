@@ -6,7 +6,7 @@ from pyslang.syntax import SyntaxKind
 from pyslang.parsing import TokenKind
 from ..ir.transition_system import TransitionSystem
 
-from .utils import _token_text, _eval_literal, _extract_name
+from .utils import _token_text, _eval_literal, _extract_name, _dim_pos_for_selector
 from .eval_expr import (
     _is_signed_expr, _is_signed_type,
     _extract_width_from_node, _dimension_width,
@@ -17,6 +17,7 @@ from .node_to_z3 import (
     _extract_call_args, _unwrap_property_wrapper, _process_system_func,
 )
 from .hier_flatten import HierarchyFlattener
+from .interface_flattener import InterfaceFlattener
 
 def _z3_slt(a, b):
     ctx = a.ctx
@@ -39,6 +40,7 @@ class RTLParser:
     _token_text = staticmethod(_token_text)
     _eval_literal = staticmethod(_eval_literal)
     _extract_name = staticmethod(_extract_name)
+    _dim_pos_for_selector = staticmethod(_dim_pos_for_selector)
     _is_signed_expr = _is_signed_expr
     _is_signed_type = _is_signed_type
     _extract_width_from_node = _extract_width_from_node
@@ -58,8 +60,13 @@ class RTLParser:
         self._past_counter = 0
         self._chain_counter = 0
         self._hier_flattener = HierarchyFlattener()
+        self._interface_flattener = InterfaceFlattener()
         self._delay_context: dict = {}  # "step_vars", "step_names", "max_step" from ##N
         self._disable_cond: z3.BoolRef | None = None
+        self._named_sequences: dict[str, object] = {}
+        self._named_properties: dict[str, object] = {}
+        self._seq_local_vars: dict[str, dict[str, str]] = {}  # seq_name -> {var_name -> ts_var_name}
+        self._current_local_vars: dict[str, str] = {}  # var_name -> ts_var_name for current context
 
     def parse_file(self, filepath: str) -> list[TransitionSystem]:
         self._module_path = filepath
@@ -87,6 +94,14 @@ class RTLParser:
 
     def _extract_modules(self, root) -> list[TransitionSystem]:
         systems = []
+        for member in root.members:
+            if member.kind == SyntaxKind.InterfaceDeclaration:
+                sp = [os.path.dirname(self._module_path)] if self._module_path else []
+                from .hier_flatten import OT_SEARCH_PATHS
+                for p in OT_SEARCH_PATHS:
+                    if os.path.isdir(p):
+                        sp.append(p)
+                self._interface_flattener.parse_interface(member, parser=self, search_paths=sp)
         for member in root.members:
             if member.kind == SyntaxKind.ModuleDeclaration:
                 ts = self._process_module(member)
@@ -178,20 +193,143 @@ class RTLParser:
             if hasattr(child, 'kind') and child.kind == SyntaxKind.PackageImportDeclaration:
                 self._resolve_package_import(child, ts)
 
+    def _detect_interface_port(self, port) -> bool:
+        """Check if port is an interface port (regular or parameterized)."""
+        if hasattr(port.header, 'modport'):
+            return True
+        h = port.header
+        if not hasattr(h, 'dataType') or h.dataType is None:
+            return False
+        dt = h.dataType
+        if dt.kind != SyntaxKind.NamedType:
+            return False
+        if not hasattr(dt, 'name') or dt.name is None:
+            return False
+        name_node = dt.name
+        # Case: plain interface name (tl_if bus) — IdentifierName
+        if name_node.kind == SyntaxKind.IdentifierName:
+            if hasattr(name_node, 'identifier') and name_node.identifier is not None:
+                raw = str(name_node.identifier).strip()
+                return raw in self._interface_flattener._interfaces
+        # Case: parameterized interface (tl_if #(.DW(16)).host bus) — multi-part name
+        try:
+            child0 = name_node[0]
+            child2 = name_node[2]
+            return ('ClassName' in str(child0.kind) and
+                    'IdentifierName' in str(child2.kind))
+        except (IndexError, TypeError):
+            return False
+
+    def _extract_interface_port_params(self, port) -> dict[str, int]:
+        """Extract parameter overrides from parameterized interface port."""
+        h = port.header
+        if not hasattr(h, 'dataType') or h.dataType is None:
+            return {}
+        dt = h.dataType
+        if dt.kind != SyntaxKind.NamedType:
+            return {}
+        try:
+            cn = dt.name[0]
+        except (IndexError, TypeError):
+            return {}
+        if not hasattr(cn, 'parameters') or cn.parameters is None:
+            return {}
+        params = {}
+        for ci in range(256):
+            try:
+                child = cn.parameters[ci]
+            except (IndexError, TypeError):
+                break
+            if hasattr(child, 'kind') and 'NamedParamAssignment' in str(child.kind):
+                pname = str(child.name).strip() if hasattr(child, 'name') and child.name else None
+                pval = None
+                if hasattr(child, 'expr') and child.expr is not None:
+                    try:
+                        pval = int(str(child.expr), 0)
+                    except (ValueError, TypeError):
+                        pass
+                if pname and pval is not None:
+                    params[pname] = pval
+        return params
+
+    def _expand_interface_port(self, port, ts):
+        """Try to expand an interface port. Returns True if expanded."""
+        # Case 1: InterfacePortHeaderSyntax (has .modport, e.g. tl_if.host bus)
+        if hasattr(port.header, 'modport'):
+            header = port.header
+            iface_name = str(header.nameOrKeyword).strip() if hasattr(header, 'nameOrKeyword') and header.nameOrKeyword else None
+            modport_name = str(header.modport).strip().lstrip('.') if hasattr(header, 'modport') and header.modport else None
+            inst_name = self._token_text(port.declarator.name) if hasattr(port.declarator, 'name') else None
+
+            # Re-route array case through expand_port_with_params for dims
+            arr_dims = self._interface_flattener._extract_port_array_dims(port, self)
+            if arr_dims and iface_name and inst_name:
+                self._interface_flattener.expand_port_with_params(
+                    iface_name, modport_name, inst_name, {}, ts, self, arr_dims=arr_dims)
+                return True
+            self._interface_flattener.expand_port(port, ts, self)
+            return True
+
+        # Case 2: Plain interface name (tl_if bus) — no modport
+        if not self._detect_interface_port(port):
+            return False
+
+        h = port.header
+        dt = h.dataType
+        name_node = dt.name
+
+        iface_name = None
+        iface_modport = None
+
+        if name_node.kind == SyntaxKind.IdentifierName:
+            iface_name = str(name_node.identifier).strip() if hasattr(name_node, 'identifier') else None
+        else:
+            try:
+                cn = name_node[0]
+                iface_name = str(cn.identifier).strip() if hasattr(cn, 'identifier') and cn.identifier else None
+                iface_modport = str(name_node[2].identifier).strip() if hasattr(name_node[2], 'identifier') else None
+            except (IndexError, TypeError):
+                return False
+
+        inst_name = None
+        if hasattr(port, 'declarator') and port.declarator is not None:
+            if hasattr(port.declarator, 'name') and port.declarator.name is not None:
+                inst_name = self._token_text(port.declarator.name)
+
+        if not iface_name or not inst_name:
+            return False
+
+        iface_params = self._extract_interface_port_params(port)
+        arr_dims = self._interface_flattener._extract_port_array_dims(port, self)
+        self._interface_flattener.expand_port_with_params(
+            iface_name, iface_modport, inst_name, iface_params, ts, self,
+            arr_dims=arr_dims)
+        return True
+
     def _extract_ports(self, header, ts: TransitionSystem):
         last_direction = None
+        last_width = None
         for port in header.ports:
             if port.kind != SyntaxKind.ImplicitAnsiPort:
                 continue
-            name, direction, width = self._parse_port_direct(port)
+            if self._expand_interface_port(port, ts):
+                continue
+            name, direction, width = self._parse_port_direct(port, ts)
             if name is None:
                 continue
+            has_explicit_dir = bool(direction)
             if direction:
                 last_direction = direction
             else:
                 direction = last_direction or "input"
             if width is None or width <= 0:
                 width = 1
+            # Multi-declarator port: no explicit direction means sharing
+            # type with previous port; inherit its width.
+            if not has_explicit_dir and last_width is not None and last_width > 1 and width == 1:
+                width = last_width
+            if width > 1:
+                last_width = width
             signed = False
             if hasattr(port.header, 'dataType') and port.header.dataType is not None:
                 signed = self._is_signed_type(port.header.dataType)
@@ -201,8 +339,15 @@ class RTLParser:
                 ts.add_state_var(name, width, signed=signed)
             elif direction == "inout":
                 ts.add_state_var(name, width, signed=signed)
+            packed_dims = []
+            if hasattr(port.header, 'dataType') and port.header.dataType is not None:
+                packed_dims = self._extract_packed_dims(port.header.dataType, ts)
+            decl_dims = self._extract_declarator_dims(port.declarator, ts)
+            full_dims = packed_dims + decl_dims
+            if full_dims:
+                ts.set_var_dims(name, full_dims, num_packed=len(packed_dims))
 
-    def _parse_port_direct(self, port) -> tuple:
+    def _parse_port_direct(self, port, ts: TransitionSystem = None) -> tuple:
         ph = port.header
         direction = None
         width = None
@@ -221,6 +366,12 @@ class RTLParser:
             w = self._extract_width_from_node(ph.dataType)
             if w is not None and w > 0:
                 width = w
+        if width is None or width <= 0:
+            width = 1
+        if ts is not None:
+            decl_dims = self._extract_declarator_dims(port.declarator, ts)
+            for d in decl_dims:
+                width *= d
 
         if not direction and hasattr(ph, 'placeholder'):
             direction = "wire"
@@ -267,6 +418,17 @@ class RTLParser:
                 self._process_data_declaration(member, ts)
             elif k == SyntaxKind.PackageImportDeclaration:
                 self._resolve_package_import(member, ts)
+            elif k == SyntaxKind.SequenceDeclaration:
+                self._process_sequence_declaration(member, ts)
+            elif k == SyntaxKind.PropertyDeclaration:
+                self._process_property_declaration(member, ts)
+            elif k == SyntaxKind.InterfaceDeclaration:
+                sp = [os.path.dirname(self._module_path)] if self._module_path else []
+                from .hier_flatten import OT_SEARCH_PATHS
+                for p in OT_SEARCH_PATHS:
+                    if os.path.isdir(p):
+                        sp.append(p)
+                self._interface_flattener.parse_interface(member, parser=self, search_paths=sp)
             elif k == SyntaxKind.DPIImport:
                 pass
             elif k == SyntaxKind.DefaultNetTypeDirective:
@@ -419,6 +581,10 @@ class RTLParser:
             self._hier_flattener.flatten_instantiation(node, ts)
         elif k == SyntaxKind.ModuleInstantiation:
             pass
+        elif k == SyntaxKind.SequenceDeclaration:
+            self._process_sequence_declaration(node, ts)
+        elif k == SyntaxKind.PropertyDeclaration:
+            self._process_property_declaration(node, ts)
         else:
             warnings.warn(f"Unhandled generate member: {k}", stacklevel=2)
         self._genvar_subst = saved
@@ -455,7 +621,7 @@ class RTLParser:
             if is_new:
                 ts.add_state_var(name, w, signed=signed)
             if full_dims and is_new:
-                ts.set_var_dims(name, full_dims)
+                ts.set_var_dims(name, full_dims, num_packed=len(packed_dims))
 
     def _extract_declarator_dims(self, decl, ts) -> list[int]:
         dims = []
@@ -560,6 +726,81 @@ class RTLParser:
                                         dims.append(abs(lv - rv) + 1)
         return dims
 
+    def _resolve_interface_dot_access(self, node):
+        if not hasattr(node, 'left') or not hasattr(node, 'right'):
+            return None
+        left = node.left
+        right = node.right
+        if not hasattr(left, 'kind') or left.kind != SyntaxKind.IdentifierName:
+            return None
+        if not hasattr(right, 'identifier'):
+            return None
+        iface_name = self._token_text(left.identifier)
+        sig_name = self._token_text(right.identifier)
+        ts_var = self._interface_flattener.resolve(iface_name, sig_name)
+        if ts_var is None:
+            return None
+        if ts_var in self._current_ts.state_vars:
+            return self._current_ts.get_cur(ts_var)
+        if ts_var in self._current_ts.inputs:
+            return self._current_ts.get_inp(ts_var)
+        return None
+
+    def _process_sequence_declaration(self, node, ts: TransitionSystem):
+        name = None
+        if hasattr(node, 'name') and node.name is not None:
+            name = self._token_text(node.name)
+        body = getattr(node, 'seqExpr', None)
+        if name and body is not None:
+            self._named_sequences[name] = body
+        if name:
+            local_map = {}
+            local_vars = getattr(node, 'variables', None)
+            if local_vars:
+                for lv in local_vars:
+                    if hasattr(lv, 'declarators'):
+                        for dcl in lv.declarators:
+                            if hasattr(dcl, 'name'):
+                                var_name = self._token_text(dcl.name)
+                                w = self._extract_width_from_node(lv.type, ts) if hasattr(lv, 'type') and lv.type is not None else 1
+                                if w is None or w <= 0:
+                                    w = 1
+                                ts_var = f"__seq_{name}_{var_name}"
+                                ts.add_state_var(ts_var, w)
+                                local_map[var_name] = ts_var
+            self._seq_local_vars[name] = local_map
+
+    def _process_property_declaration(self, node, ts: TransitionSystem):
+        name = None
+        if hasattr(node, 'name') and node.name is not None:
+            name = self._token_text(node.name)
+        body = getattr(node, 'propertySpec', None)
+        if name and body is not None:
+            self._named_properties[name] = body
+
+    def _process_seq_match_list(self, node, ts):
+        for child in node:
+            if not hasattr(child, 'kind'):
+                continue
+            if child.kind == SyntaxKind.SimplePropertyExpr or child.kind == SyntaxKind.SimpleSequenceExpr:
+                inner = child.expr if hasattr(child, 'expr') else None
+                while inner is not None and hasattr(inner, 'kind') and (inner.kind == SyntaxKind.SimpleSequenceExpr or inner.kind == SyntaxKind.SimplePropertyExpr):
+                    inner = inner.expr if hasattr(inner, 'expr') else None
+                if inner is not None and hasattr(inner, 'kind') and inner.kind == SyntaxKind.AssignmentExpression:
+                    lname = self._extract_name(inner.left)
+                    if lname and lname in self._current_local_vars:
+                        ts_var = self._current_local_vars[lname]
+                        r_expr = self._node_to_z3(inner.right)
+                        if ts_var in ts.state_vars:
+                            tw = ts.state_vars[ts_var].width
+                            ew = r_expr.size()
+                            if tw != ew:
+                                if tw > ew:
+                                    r_expr = z3.ZeroExt(tw - ew, r_expr)
+                                else:
+                                    r_expr = z3.Extract(tw - 1, 0, r_expr)
+                            ts.set_next_state(ts_var, r_expr)
+
     def _process_always_ff(self, block, ts: TransitionSystem):
         self._current_ts = ts
         stmt = block.statement
@@ -599,6 +840,10 @@ class RTLParser:
                 return
 
             search_paths = []
+            from .hier_flatten import OT_SEARCH_PATHS
+            for sp in OT_SEARCH_PATHS:
+                if os.path.isdir(sp):
+                    search_paths.append(sp)
             if self._module_path:
                 search_paths.append(os.path.dirname(self._module_path))
                 # Try OpenTitan standard paths
@@ -917,7 +1162,7 @@ class RTLParser:
                         bw = max(old_val.size(), expr.size())
                         if old_val.size() < bw:
                             old_val = z3.ZeroExt(bw - old_val.size(), old_val)
-                        bit_val = z3.Extract(i, i, expr) if i < expr.size() else z3.BitVecVal(0, 1)
+                        bit_val = expr if expr.size() == 1 else (z3.Extract(i, i, expr) if i < expr.size() else z3.BitVecVal(0, 1))
                         if i >= bw:
                             result[var_name] = z3.Concat(z3.ZeroExt(i - bw, old_val), bit_val)
                         elif i == bw - 1:
@@ -997,7 +1242,7 @@ class RTLParser:
                             bw = max(old_val.size(), expr.size())
                             if old_val.size() < bw:
                                 old_val = z3.ZeroExt(bw - old_val.size(), old_val)
-                            bit_val = z3.Extract(i, i, expr) if i < expr.size() else z3.BitVecVal(0, 1)
+                            bit_val = expr if expr.size() == 1 else (z3.Extract(i, i, expr) if i < expr.size() else z3.BitVecVal(0, 1))
                             if i >= bw:
                                 result[var_name] = z3.Concat(z3.ZeroExt(i - bw, old_val), bit_val)
                             elif i == bw - 1:
@@ -1079,7 +1324,6 @@ class RTLParser:
         bw = base.size()
         result = base
         var_dims = ts.get_var_dims(lname) if hasattr(ts, 'get_var_dims') else []
-        num_sel = len(left.selectors)
         for idx, sel in enumerate(left.selectors):
             if sel.kind == SyntaxKind.ElementSelect:
                 s = sel.selector
@@ -1092,7 +1336,8 @@ class RTLParser:
                     # full_dims = [packed_dims..., unpacked_dims...].
                     # The LAST dimension corresponds to the first selector (outer-most unpacked),
                     # the second-to-last to the second selector, etc.
-                    dim_pos = num_sel - 1 - idx
+                    num_packed = ts.get_var_num_packed(lname) if hasattr(ts, 'get_var_num_packed') else 0
+                    dim_pos = self._dim_pos_for_selector(idx, num_packed, len(var_dims))
                     if 0 <= dim_pos < len(var_dims):
                         ew = bw // var_dims[dim_pos]
                         if ew <= 0:
@@ -1221,6 +1466,13 @@ class RTLParser:
                         *[(ts.get_cur(n), cur[n]) for n in ts.state_vars]
                     )
                     step_constraints.append(nxt[name] == shifted)
+            # Propagate combinational constraints to step k
+            for c in ts._comb_constraints:
+                shifted = z3.substitute(
+                    c,
+                    *[(ts.get_cur(n), nxt[n]) for n in ts.state_vars]
+                )
+                step_constraints.append(shifted)
         return step_vars, step_constraints
 
     def _apply_repetition(self, inner_expr: z3.BoolRef, ts: TransitionSystem,
@@ -1384,17 +1636,30 @@ class RTLParser:
                                 *[(ts.get_cur(n), cur[n]) for n in ts.state_vars]
                             )
                             extra.append(ext[name] == shifted)
+                    for c in ts._comb_constraints:
+                        shifted = z3.substitute(
+                            c,
+                            *[(ts.get_cur(n), ext[n]) for n in ts.state_vars]
+                        )
+                        extra.append(shifted)
                     cons_delayed = z3.substitute(
                         cons,
                         *[(ts.get_cur(name), ext[name]) for name in ts.state_vars]
                     )
                     tp_expr = z3.Implies(z3.And(ant, *extra), cons_delayed)
                 else:
+                    next_extra = []
+                    for c in ts._comb_constraints:
+                        shifted = z3.substitute(
+                            c,
+                            *[(ts.get_cur(n), ts.get_next(n)) for n in ts.state_vars]
+                        )
+                        next_extra.append(shifted)
                     cons_next = z3.substitute(
                         cons,
                         *[(ts.get_cur(name), ts.get_next(name)) for name in ts.state_vars]
                     )
-                    tp_expr = z3.Implies(ant, cons_next)
+                    tp_expr = z3.Implies(z3.And(ant, *next_extra), cons_next)
                 self._delay_context = {}
                 dc = self._disable_cond
                 if dc is not None:
@@ -1439,9 +1704,14 @@ class RTLParser:
             return None
 
         if k == SyntaxKind.ParenthesizedSequenceExpr:
-            if hasattr(node, 'expr'):
-                return self._property_to_z3(node.expr, clock, ts, directive, source=source)
-            return None
+            result = None
+            if hasattr(node, 'expr') and node.expr is not None:
+                result = self._property_to_z3(node.expr, clock, ts, directive, source=source)
+            for child in node:
+                if hasattr(child, 'kind') and child.kind == SyntaxKind.SequenceMatchList:
+                    self._process_seq_match_list(child, ts)
+                    break
+            return result if result is not None else z3.BoolVal(True)
 
         if k == SyntaxKind.UnaryPropertyExpr:
             inner = None
@@ -1597,6 +1867,8 @@ class RTLParser:
                         if hasattr(dc, 'kind') and 'SimpleSequence' in str(dc.kind):
                             right_seq = dc
                             break
+                if right_seq is None and hasattr(delay_elem, 'expr') and delay_elem.expr is not None:
+                    right_seq = delay_elem.expr
                 if right_seq is None:
                     return left_expr
                 right_expr = self._property_to_z3(right_seq, clock, ts, directive, source=source)
@@ -1704,6 +1976,20 @@ class RTLParser:
 
         if k == SyntaxKind.SequenceRepetition:
             return None
+
+        if k == SyntaxKind.IdentifierName:
+            name = self._token_text(node.identifier)
+            if name in self._named_properties:
+                prop_body = self._named_properties[name]
+                if hasattr(prop_body, 'expr'):
+                    return self._property_to_z3(prop_body.expr, clock, ts, directive, source=source)
+            if name in self._named_sequences:
+                seq_body = self._named_sequences[name]
+                saved = dict(self._current_local_vars)
+                self._current_local_vars.update(self._seq_local_vars.get(name, {}))
+                result = self._property_to_z3(seq_body, clock, ts, directive, source=source)
+                self._current_local_vars = saved
+                return result
 
         prop_bv = self._node_to_z3(node)
         if prop_bv is not None:

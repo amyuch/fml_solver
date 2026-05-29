@@ -14,6 +14,8 @@ from ..ir.transition_system import TransitionSystem
 OT_SEARCH_PATHS = [
     "/home/AM/hack2dac/opentitan/hw/ip/prim/rtl",
     "/home/AM/hack2dac/opentitan/hw/ip",
+    "/home/AM/hack2dac/opentitan/hw/ip/tlul/rtl",
+    "/home/AM/fml_tr/benchmarks/prim",
 ]
 
 
@@ -67,7 +69,12 @@ class HierarchyFlattener:
         try:
             text = preprocess_file(path)
             parser = self._get_parser()
-            ts = parser.parse_text_to_ts(text)
+            saved_counter = parser._past_counter
+            parser._past_counter = 0
+            try:
+                ts = parser.parse_text_to_ts(text)
+            finally:
+                parser._past_counter = saved_counter
             self._module_cache[mod_name] = ts
             return ts
         except Exception as e:
@@ -76,7 +83,8 @@ class HierarchyFlattener:
 
     def flatten_instantiation(self, node, ts: TransitionSystem):
         """Process a HierarchyInstantiation node, inlining sub-module logic."""
-        mod_name = _token_text(node.type)
+        mod_name = (node.type.valueText if hasattr(node.type, 'valueText') else
+                     _token_text(node.type).split()[-1])
         sub_ts = self.parse_and_cache_module(mod_name)
         if sub_ts is None:
             warnings.warn(f"Skipping instantiation of unknown module '{mod_name}'")
